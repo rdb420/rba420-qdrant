@@ -277,7 +277,7 @@ service:
   enable_cors: true
 
   # Enable HTTPS for the REST and gRPC API
-  enable_tls: false
+  enable_tls: true
 
   # Check user HTTPS client certificate against CA file specified in tls config
   verify_https_client_certificate: false
@@ -372,10 +372,10 @@ telemetry_disabled: false
 # Required if either service.enable_tls or cluster.p2p.enable_tls is true.
 tls:
   # Server certificate chain file
-  cert: ./tls/cert.pem
+  cert: ./storage/tls/cert.pem
 
   # Server private key file
-  key: ./tls/key.pem
+  key: ./storage/tls/key.pem
 
   # Certificate authority certificate file.
   # This certificate will be used to validate the certificates
@@ -385,7 +385,7 @@ tls:
   # HTTPS client certificate
   #
   # Required if cluster.p2p.enable_tls is true.
-  ca_cert: ./tls/cacert.pem
+  ca_cert: ./storage/tls/cacert.pem
 
   # TTL in seconds to reload certificate from disk, useful for certificate rotations.
   # Only works for HTTPS endpoints. Does not support gRPC (and intra-cluster communication).
