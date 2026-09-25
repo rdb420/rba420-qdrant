@@ -4,6 +4,7 @@
 //! The collection layer provides the strategy via `OptimizationStrategy`.
 
 use std::collections::HashSet;
+use std::debug_assert_matches;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -30,7 +31,7 @@ use segment::entry::{
 };
 use segment::segment::{Segment, SegmentVersion};
 use segment::segment_constructor::segment_builder::SegmentBuilder;
-use segment::types::PointIdType;
+use segment::types::{PointIdType, VectorNameBuf};
 use uuid::Uuid;
 
 use crate::locked_segment::LockedSegment;
@@ -38,8 +39,10 @@ use crate::proxy_segment::{
     DeletedPoints, IntendedVector, ProxyIndexChange, ProxyIndexChanges, ProxyVectorNameChanges,
     UnsyncedProxySegment,
 };
+use crate::quota::{self, DiskFit};
 use crate::segment_holder::SegmentId;
 use crate::segment_holder::locked::LockedSegmentHolder;
+use crate::segment_manifest::NewSegmentToken;
 
 /// Result of optimization execution
 #[derive(Debug)]
@@ -68,10 +71,25 @@ pub trait OptimizationStrategy: Send {
     ) -> OperationResult<SegmentBuilder>;
 
     /// Create a temporary COW segment for writes during optimization.
-    fn create_temp_segment(&self) -> OperationResult<LockedSegment>;
+    ///
+    /// Returns the segment together with the [`NewSegmentToken`] obliging the caller to register it
+    /// in the manifest once it is published into the holder.
+    fn create_temp_segment(&self) -> OperationResult<(LockedSegment, NewSegmentToken)>;
+
+    /// Vector names currently present in the live collection schema, if a live source is wired in.
+    ///
+    /// `None` means the live schema is unknown, in which case the merge must treat a source vector
+    /// name absent from the target conservatively (cancel). When present, it lets the builder tell a
+    /// genuinely deleted vector (safe to prune) from the CreateVectorName-vs-optimizer race (must
+    /// cancel). See [`SegmentBuilder::set_live_vector_names`].
+    fn live_vector_names(&self) -> Option<HashSet<VectorNameBuf>>;
 }
 
 /// Restores original segments from proxies
+///
+/// Proxied changes (deleted points, index and vector-name changes) are always propagated into the
+/// wrapped segments first, so they are not lost when the proxies are dropped. If that propagation
+/// fails, no proxy is unwrapped and the error is returned.
 ///
 /// # Arguments
 ///
@@ -80,12 +98,36 @@ pub trait OptimizationStrategy: Send {
 ///
 /// # Result
 ///
-/// Original segments are pushed into `segments`, proxies removed.
+/// Original segments are pushed into `segments`, proxies removed. On a propagation error the
+/// proxies are left in the holder untouched.
 pub fn unwrap_proxy(
     segments: &LockedSegmentHolder,
     proxy_ids: &[SegmentId],
 ) -> OperationResult<()> {
-    let mut segments_lock = segments.write();
+    // Propagate proxied changes back into wrapped segment to not lose these in-memory changes
+    let segments_lock = segments.upgradable_read();
+    let _update_guard = segments.acquire_updates_lock();
+
+    let proxies: Vec<_> = proxy_ids
+        .iter()
+        .filter_map(|&proxy_id| match segments_lock.get(proxy_id).cloned() {
+            Some(LockedSegment::Proxy(proxy_segment)) => Some((proxy_id, proxy_segment)),
+            _ => None,
+        })
+        .collect();
+    for (proxy_id, proxy_segment) in &proxies {
+        // Unwrapping a proxy whose changes did not reach the wrapped segment loses those deletes
+        // and index changes for good, so bail out instead. Every proxy stays installed and keeps
+        // serving its changes; nothing is unwrapped, so nothing is lost.
+        if let Err(err) = proxy_segment.write().propagate_to_wrapped() {
+            log::error!(
+                "Propagating proxy segment {proxy_id} changes to wrapped segment failed: {err}",
+            );
+            return Err(err);
+        }
+    }
+
+    let mut segments_lock = RwLockUpgradableReadGuard::upgrade(segments_lock);
     for &proxy_id in proxy_ids {
         if let Some(proxy_segment_ref) = segments_lock.get(proxy_id) {
             let locked_proxy_segment = proxy_segment_ref.clone();
@@ -251,6 +293,15 @@ fn build_new_segment<F: ?Sized + OptimizationStrategy>(
 
     if !defragmentation_keys.is_empty() {
         segment_builder.set_defragment_keys(defragmentation_keys.into_iter().collect());
+    }
+
+    // Wire in the live collection schema so the merge can distinguish a deleted vector (prune it)
+    // from the CreateVectorName race (cancel). Read here, after the proxy install froze the source
+    // segments: the schema is persisted before a vector-name op reaches the segments, so any name a
+    // frozen source carries is guaranteed visible in this read, and no concurrent create can be
+    // missed (which would otherwise cause a wrong prune).
+    if let Some(live_vector_names) = factory.live_vector_names() {
+        segment_builder.set_live_vector_names(live_vector_names);
     }
 
     {
@@ -544,6 +595,7 @@ fn finish_optimization(
 
     // Replace proxy segments with new optimized segment
     let point_count = optimized_segment.available_point_count();
+    let optimized_segment_version = optimized_segment.version();
     let mut writable_segment_holder = RwLockUpgradableReadGuard::upgrade(upgradable_segment_holder);
 
     let (_, proxies) = writable_segment_holder.swap_new(optimized_segment, proxy_ids);
@@ -582,6 +634,35 @@ fn finish_optimization(
             .try_for_each(|chunk| read_segment_holder.deduplicate_points(chunk, hw_counter))?;
     }
 
+    // It is important to update manifest before we retire proxy data,
+    // as we don't want to have a situation, where new segment is not yet registered, but
+    // old segment data is already dropped.
+    read_segment_holder.sync_segment_manifest(None)?;
+
+    // Don't destroy the replaced segments' data yet. Points were copy-on-write moved out of them
+    // (and out of the optimized segment's in-memory state, which the next optimization bakes into
+    // its build output) while their new copies may still sit unflushed in appendable segments. WAL
+    // replay can only re-derive those moves from the on-disk pre-images, so the files must survive
+    // until a flush proves this optimization durable. Register the destruction as a post-flush
+    // action: it runs once the durable waterline covers `optimized_segment_version`, and until then
+    // the WAL acknowledge stays capped at each source's persisted version (the same pin the proxy
+    // imposed while the optimization ran), so every operation the files contradict, deletions in
+    // particular, is replayed and re-applied on a restart. See
+    // `SegmentHolder::register_post_flush_action`.
+    //
+    // This cap has to be tracked at the holder level because the proxy can no longer
+    // impose it. While a proxy was a member of the holder it pinned the WAL acknowledge for
+    // free: its `persistent_version` reported the wrapped source's durable point while its
+    // `version` climbed with every propagated change, so `flush_all` saw unsaved work and
+    // capped the ack there. The `swap_new` above evicted the proxies, so that contribution is
+    // gone from the holder's flush accounting even though the source files it protected are
+    // still on disk. `register_segment_drop` re-expresses the same pin independently of segment
+    // membership, snapshotting each proxy's final `persistent_version` as `ack_pin`.
+    for proxy in proxies {
+        let ack_pin = proxy.get().read().persistent_version();
+        read_segment_holder.register_segment_drop(optimized_segment_version, ack_pin, proxy);
+    }
+
     drop(read_segment_holder);
     // Allow updates again
     drop(update_guard);
@@ -589,16 +670,19 @@ fn finish_optimization(
     // Drop all pointers to proxies, so we can de-arc them
     drop(locked_proxies);
 
-    // Only remove data after we ensure the consistency of the collection.
-    // If remove fails - we will still have operational collection with reported error.
-    for proxy in proxies {
-        proxy.drop_data()?;
-    }
-
     Ok(point_count)
 }
 
 /// Returns error if segment size is larger than available disk space
+///
+/// The verdict comes from [`QuotaManager::fits_on_disk`], the node's single
+/// reader of disk usage, so an optimizer starting up does not repeat a `statvfs`
+/// the quota check just took. It answers against physical free space only: this
+/// refuses an optimization that provably cannot fit, never one that the quota
+/// would refuse an update for — optimizations are what free a full disk, so
+/// gating them on one would remove the way out.
+///
+/// [`QuotaManager::fits_on_disk`]: crate::quota::QuotaManager::fits_on_disk
 fn check_segments_size(
     optimizer_name: &str,
     optimizing_segments: &[LockedSegment],
@@ -649,45 +733,41 @@ fn check_segments_size(
         })?;
     }
 
-    let space_available = match fs4::available_space(temp_path) {
-        Ok(available) => Some(available),
-        Err(err) => {
-            log::debug!(
-                "Could not estimate available storage space in `{}`: {}",
-                temp_path.display(),
-                err
-            );
-            None
-        }
+    let Some(space_needed) = space_needed else {
+        log::warn!(
+            "Could not estimate the space needed by `{optimizer_name}`; will try optimizing anyway",
+        );
+        return Ok(());
     };
 
-    match (space_available, space_needed) {
-        (Some(space_available), Some(space_needed)) => {
+    match quota::global().fits_on_disk(temp_path, space_needed) {
+        DiskFit::Fits { available } => {
             if space_needed > 0 {
                 log::debug!(
                     "Available space: {}, needed for optimization: {}",
-                    bytes_to_human(space_available as usize),
+                    bytes_to_human(available as usize),
                     bytes_to_human(space_needed as usize),
                 );
             }
-            if space_available < space_needed {
-                return Err(
-                    segment::common::operation_error::OperationError::service_error(format!(
-                        "Not enough space available for optimization, needed: {}, available: {}",
-                        bytes_to_human(space_needed as usize),
-                        bytes_to_human(space_available as usize),
-                    )),
-                );
-            }
+            Ok(())
         }
-        _ => {
+        DiskFit::TooLarge {
+            available,
+            required,
+        } => Err(
+            segment::common::operation_error::OperationError::service_error(format!(
+                "Not enough space available for optimization, needed: {}, available: {}",
+                bytes_to_human(required as usize),
+                bytes_to_human(available as usize),
+            )),
+        ),
+        DiskFit::Unknown => {
             log::warn!(
                 "Could not estimate available storage space in `{optimizer_name}`; will try optimizing anyway",
             );
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
 /// Performs optimization of segments (merge / reindex / vacuum, etc.)
@@ -745,9 +825,14 @@ pub fn execute_optimization<F: ?Sized + OptimizationStrategy>(
 
     let hw_counter = HardwareCounterCell::disposable();
 
-    let extra_cow_segment_opt = need_extra_cow_segment
-        .then(|| factory.create_temp_segment())
-        .transpose()?;
+    // Building the cow segment yields a `NewSegmentToken`; we register it below, once it is added to
+    // the holder, and before the slow build can route writes into it.
+    let (extra_cow_segment_opt, extra_cow_token_opt) = if need_extra_cow_segment {
+        let (segment, token) = factory.create_temp_segment()?;
+        (Some(segment), Some(token))
+    } else {
+        (None, None)
+    };
 
     let mut proxies = Vec::new();
     for sg in input_segments.iter() {
@@ -764,6 +849,9 @@ pub fn execute_optimization<F: ?Sized + OptimizationStrategy>(
     // If this ends up not being saved due to a crash, the segment will not be used
     match &extra_cow_segment_opt {
         Some(LockedSegment::Original(segment)) => {
+            // Register the freshly added cow segment in the manifest before we save the version,
+            // it guarantees that no writes will happen into unregistered segment.
+            segment_holder_read.sync_segment_manifest(extra_cow_token_opt)?;
             let segment_path = &segment.read().segment_path;
             SegmentVersion::save(segment_path)?;
         }
@@ -785,9 +873,10 @@ pub fn execute_optimization<F: ?Sized + OptimizationStrategy>(
             // Also helps to ensure the delete propagation behavior in
             // `optimize_segment_propagate_changes` remains  sound.
             // See: <https://github.com/qdrant/qdrant/pull/7208>
-            debug_assert!(
-                matches!(proxy.wrapped_segment(), LockedSegment::Original(_)),
-                "during optimization, wrapped segment must not be another proxy segment"
+            debug_assert_matches!(
+                proxy.wrapped_segment(),
+                LockedSegment::Original(_),
+                "during optimization, wrapped segment must not be another proxy segment",
             );
 
             // Now that this write lock froze the wrapped segment, finalize the proxy: this syncs
@@ -842,16 +931,17 @@ pub fn execute_optimization<F: ?Sized + OptimizationStrategy>(
     let (optimized_segment, already_remove_points) = match build_result {
         Ok(result) => result,
         Err(err) => {
-            // Properly cancel optimization on all error kinds
-            // Unwrap proxies and add temp segment to holder
-            unwrap_proxy(&segment_holder, &proxy_ids)?;
             // A graceful cancellation always happens before the optimized segment is swapped into
             // the holder, so the segment `build` already moved into `segments_path` is now an
-            // orphan that `Drop` won't remove. Delete it explicitly. Non-cancellation errors may
-            // occur after the swap, where the segment is live, so they are left untouched.
+            // orphan that `Drop` won't remove. Delete it explicitly, before unwrapping the proxies
+            // so a failure there cannot leave it behind. Non-cancellation errors may occur after
+            // the swap, where the segment is live, so they are left untouched.
             if matches!(err, OperationError::Cancelled { .. }) {
                 cleanup_cancelled_optimized_segment(&paths.segments_path, output_segment_uuid);
             }
+            // Properly cancel optimization on all error kinds
+            // Unwrap proxies and add temp segment to holder
+            unwrap_proxy(&segment_holder, &proxy_ids)?;
             return Err(err);
         }
     };
@@ -869,16 +959,17 @@ pub fn execute_optimization<F: ?Sized + OptimizationStrategy>(
     ) {
         Ok(points_count) => points_count,
         Err(err) => {
-            // Properly cancel optimization on all error kinds
-            // Unwrap proxies and add temp segment to holder
-            unwrap_proxy(&segment_holder, &proxy_ids)?;
             // A graceful cancellation always happens before the optimized segment is swapped into
             // the holder, so the segment `build` already moved into `segments_path` is now an
-            // orphan that `Drop` won't remove. Delete it explicitly. Non-cancellation errors may
-            // occur after the swap, where the segment is live, so they are left untouched.
+            // orphan that `Drop` won't remove. Delete it explicitly, before unwrapping the proxies
+            // so a failure there cannot leave it behind. Non-cancellation errors may occur after
+            // the swap, where the segment is live, so they are left untouched.
             if matches!(err, OperationError::Cancelled { .. }) {
                 cleanup_cancelled_optimized_segment(&paths.segments_path, output_segment_uuid);
             }
+            // Properly cancel optimization on all error kinds
+            // Unwrap proxies and add temp segment to holder
+            unwrap_proxy(&segment_holder, &proxy_ids)?;
             return Err(err);
         }
     };
@@ -888,4 +979,58 @@ pub fn execute_optimization<F: ?Sized + OptimizationStrategy>(
     timer.set_success(true);
 
     Ok(OptimizationResult { points_count })
+}
+
+#[cfg(test)]
+mod tests {
+    use common::counter::hardware_counter::HardwareCounterCell;
+    use common::types::DeferredBehavior;
+    use tempfile::Builder;
+
+    use super::*;
+    use crate::fixtures::build_segment_1;
+    use crate::proxy_segment::ProxySegment;
+    use crate::segment_holder::SegmentHolder;
+
+    /// A cancelled optimization puts the wrapped segments back into the holder, so the deletions
+    /// recorded on the proxy while the optimization ran must reach the wrapped segment first.
+    /// Without that, the point's pre-optimization copy stays live next to whatever the write
+    /// segment holds for it, and reads see both.
+    #[test]
+    fn unwrap_proxy_propagates_deletes_to_wrapped_segment() {
+        let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+        let hw_counter = HardwareCounterCell::new();
+
+        let wrapped = LockedSegment::new(build_segment_1(dir.path()));
+        let mut holder = SegmentHolder::default();
+        let segment_id = holder.add_new_locked(wrapped.clone());
+
+        // Wrap it the way an optimization does, then delete a point through the proxy: the
+        // deletion is recorded on the proxy, the wrapped segment still has the point.
+        let mut proxy = ProxySegment::new(wrapped.clone());
+        proxy.delete_point(100, 1.into(), &hw_counter).unwrap();
+        let holder = LockedSegmentHolder::new(holder);
+        holder
+            .write()
+            .replace(segment_id, LockedSegment::from(proxy))
+            .unwrap();
+        assert!(
+            wrapped
+                .get()
+                .read()
+                .has_point(1.into(), DeferredBehavior::WithDeferred),
+            "wrapped segment should still hold the point while proxied",
+        );
+
+        unwrap_proxy(&holder, &[segment_id]).unwrap();
+
+        assert!(
+            !wrapped
+                .get()
+                .read()
+                .has_point(1.into(), DeferredBehavior::WithDeferred),
+            "deletion recorded on the proxy must reach the wrapped segment before it goes back \
+             into the holder",
+        );
+    }
 }

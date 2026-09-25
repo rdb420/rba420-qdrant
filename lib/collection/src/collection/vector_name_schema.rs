@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::num::NonZeroU64;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
@@ -105,6 +109,7 @@ fn dense_config_to_params(config: &DenseVectorConfig) -> VectorParams {
         hnsw_config: None,
         quantization_config: None,
         on_disk: None,
+        memory: None,
         datatype: datatype.map(storage_datatype_to_collection),
         multivector_config: *multivector_config,
     }
@@ -117,6 +122,7 @@ fn sparse_config_to_params(config: &SparseVectorConfig) -> SparseVectorParams {
         index: datatype.map(|dt| crate::operations::types::SparseIndexParams {
             full_scan_threshold: None,
             on_disk: None,
+            memory: None,
             datatype: Some(storage_datatype_to_collection(dt)),
         }),
         modifier: *modifier,
@@ -131,7 +137,7 @@ fn sparse_config_to_params(config: &SparseVectorConfig) -> SparseVectorParams {
 /// a conflicting kind (dense vs. sparse). This guards against silently overwriting the
 /// stored schema with a different one while shards keep the old one — shard-level
 /// `CreateVectorName` is idempotent and will not re-apply the new config.
-fn add_vector_to_config(
+pub fn add_vector_to_config(
     params: &mut crate::config::CollectionParams,
     vector_name: &VectorNameBuf,
     config: &VectorNameConfig,
@@ -221,7 +227,7 @@ fn sparse_schema_matches(existing: &SparseVectorParams, config: &SparseVectorCon
         && existing_datatype == datatype.map(storage_datatype_to_collection)
 }
 
-fn remove_vector_from_config(
+pub fn remove_vector_from_config(
     params: &mut crate::config::CollectionParams,
     vector_name: &VectorNameBuf,
 ) {

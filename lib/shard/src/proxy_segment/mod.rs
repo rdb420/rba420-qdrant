@@ -34,8 +34,6 @@ pub struct ProxySegment {
     changed_indexes: ProxyIndexChanges,
     changed_vector_names: ProxyVectorNameChanges,
     /// Points which should no longer used from wrapped_segment
-    /// May contain points which are not in wrapped_segment,
-    /// because the set is shared among all proxy segments
     deleted_points: DeletedPoints,
     deleted_deferred_count: usize,
     wrapped_config: SegmentConfig,
@@ -52,7 +50,7 @@ pub struct ProxySegment {
 /// while only a read/upgradable-read lock is held, so an upsert or delete can still land on the
 /// not-yet-frozen wrapped segment afterwards. An upsert landing in that window extends the wrapped
 /// segment's point count past the snapshot; the scored search path then treats every offset beyond
-/// `deleted_mask` as deleted (`check_deleted_condition` defaults out-of-range to `true`), silently
+/// `deleted_mask` as deleted (`NotDeletedChecker` defaults out-of-range to deleted), silently
 /// dropping a live point from filtered KNN even though scroll/count/retrieve still see it.
 ///
 /// To make this impossible to get wrong, [`ProxySegment::new`] hands back this type rather than a

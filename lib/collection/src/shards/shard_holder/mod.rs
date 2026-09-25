@@ -1,9 +1,11 @@
 pub mod recovery_guard;
 mod resharding;
+pub(crate) use resharding::ReshardingCheck;
 pub(crate) mod shard_mapping;
 pub mod shared_shard_holder;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::debug_assert_matches;
 use std::ops::Deref as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -60,7 +62,7 @@ use crate::shards::shard_config::ShardConfig;
 use crate::shards::shard_holder::recovery_guard::{
     ActiveRecoveries, RecoveryProgressHandle, ShardRecoveryGuard,
 };
-use crate::shards::transfer::{ShardTransfer, ShardTransferKey};
+use crate::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferMethod};
 use crate::shards::{CollectionId, check_shard_path, shard_initializing_flag_path};
 
 const SHARD_TRANSFERS_FILE: &str = "shard_transfers";
@@ -250,34 +252,63 @@ impl ShardHolder {
         shard: ShardReplicaSet,
         shard_key: Option<ShardKey>,
     ) -> CollectionResult<()> {
-        let evicted = self.shards.insert(shard_id, Arc::new(shard));
-        if let Some(evicted) = evicted {
-            debug_assert!(false, "Overwriting existing shard id {shard_id}");
-            evicted.stop_gracefully().await;
+        self.add_shards(vec![(shard_id, shard)], shard_key).await
+    }
+
+    /// Add batch of shards to shard holder and atomically update shard key mapping.
+    ///
+    /// ## Cancel safety
+    ///
+    /// This function is **not** cancel safe.
+    pub async fn add_shards(
+        &mut self,
+        shards: Vec<(ShardId, ShardReplicaSet)>,
+        shard_key: Option<ShardKey>,
+    ) -> CollectionResult<()> {
+        if shards.is_empty() {
+            return Ok(());
         }
 
-        self.rings
-            .entry(shard_key.clone())
-            .or_insert_with(HashRingRouter::single)
-            .add(shard_id);
+        // Persist mapping first: it is the only fallible step, so a failed write leaves
+        // in-memory state untouched.
+        if let Some(shard_key) = &shard_key {
+            self.key_mapping.write_optional(|mapping| {
+                let mut mapping = mapping.clone();
+                let shard_ids = mapping.entry(shard_key.clone()).or_default();
 
-        if let Some(shard_key) = shard_key {
-            self.key_mapping.write_optional(|key_mapping| {
-                let has_id = key_mapping
-                    .get(&shard_key)
-                    .map(|shard_ids| shard_ids.contains(&shard_id))
-                    .unwrap_or(false);
+                let mut changed = false;
 
-                if has_id {
-                    return None;
+                for &(shard_id, _) in &shards {
+                    changed |= shard_ids.insert(shard_id);
                 }
-                let mut copy_of_mapping = key_mapping.clone();
-                let shard_ids = copy_of_mapping.entry(shard_key.clone()).or_default();
-                shard_ids.insert(shard_id);
-                Some(copy_of_mapping)
+
+                if changed { Some(mapping) } else { None }
             })?;
-            self.shard_id_to_key_mapping.insert(shard_id, shard_key);
         }
+
+        let ring = self
+            .rings
+            .entry(shard_key.clone())
+            .or_insert_with(HashRingRouter::single);
+
+        for &(shard_id, _) in &shards {
+            ring.add(shard_id);
+        }
+
+        for (shard_id, shard) in shards {
+            let evicted = self.shards.insert(shard_id, Arc::new(shard));
+
+            if let Some(evicted) = evicted {
+                debug_assert!(false, "Overwriting existing shard id {shard_id}");
+                evicted.stop_gracefully().await;
+            }
+
+            if let Some(shard_key) = &shard_key {
+                self.shard_id_to_key_mapping
+                    .insert(shard_id, shard_key.clone());
+            }
+        }
+
         Ok(())
     }
 
@@ -318,11 +349,9 @@ impl ShardHolder {
         let ids_to_key = self.get_shard_id_to_key_mapping();
         for shard_id in self.shards.keys() {
             let shard_key = ids_to_key.get(shard_id).cloned();
-            debug_assert!(
-                matches!(
-                    (self.sharding_method, &shard_key),
-                    (ShardingMethod::Auto, None) | (ShardingMethod::Custom, Some(_)),
-                ),
+            debug_assert_matches!(
+                (self.sharding_method, &shard_key),
+                (ShardingMethod::Auto, None) | (ShardingMethod::Custom, Some(_)),
                 "auto sharding cannot have shard key, custom sharding must have shard key ({:?}, {shard_key:?})",
                 self.sharding_method,
             );
@@ -454,6 +483,70 @@ impl ShardHolder {
         Ok(changed)
     }
 
+    /// Update an existing transfer record's method in place, preserving its `sync` flag.
+    /// This is the last durable write of a shard-transfer restart.
+    ///
+    /// The record is updated in place, never removed and re-inserted, so it is
+    /// always present. A restart replayed after a crash can therefore always find
+    /// the record and re-run.
+    ///
+    /// Returns the resulting record:
+    /// - No matching record: returns `None`. The record is never removed during a
+    ///   restart, so this is a stale duplicate restart (the caller dismisses it).
+    /// - Method already updated: returns the record unchanged, without writing.
+    ///   This is a replay whose method update already landed.
+    /// - Otherwise: replaces the method (resetting `to_shard_id` and `filter`) and
+    ///   returns the updated record.
+    pub fn register_restart_transfer(
+        &self,
+        key: &ShardTransferKey,
+        new_method: ShardTransferMethod,
+    ) -> CollectionResult<Option<ShardTransfer>> {
+        let mut updated = None;
+
+        self.shard_transfers.write_optional(|transfers| {
+            let existing = transfers.iter().find(|transfer| key.check(transfer))?;
+
+            // Replay: the method was already updated on a previous apply. Return
+            // the record without rewriting the file.
+            if existing.method == Some(new_method) {
+                updated = Some(existing.clone());
+                return None;
+            }
+
+            let new_transfer = ShardTransfer {
+                shard_id: existing.shard_id,
+                to_shard_id: None,
+                from: existing.from,
+                to: existing.to,
+                // Preserve the sync flag from the old transfer
+                sync: existing.sync,
+                method: Some(new_method),
+                filter: None,
+            };
+
+            let mut transfers = transfers.clone();
+            transfers.retain(|transfer| !key.check(transfer));
+            transfers.insert(new_transfer.clone());
+            updated = Some(new_transfer);
+            Some(transfers)
+        })?;
+
+        // A restart is semantically the old transfer aborted and a new one
+        // started; notify watchers as that pair (there is no dedicated Restart
+        // change variant).
+        if let Some(transfer) = &updated {
+            let _ = self
+                .shard_transfer_changes
+                .send(ShardTransferChange::Abort(*key));
+            let _ = self
+                .shard_transfer_changes
+                .send(ShardTransferChange::Start(transfer.clone()));
+        }
+
+        Ok(updated)
+    }
+
     pub fn register_finish_transfer(&self, key: &ShardTransferKey) -> CollectionResult<bool> {
         let any_removed = self
             .shard_transfers
@@ -489,13 +582,19 @@ impl ShardHolder {
         (incoming, outgoing)
     }
 
-    /// Start tracking recovery progress for a shard (destination side).
+    /// Start a snapshot recovery of a shard (destination side).
     ///
-    /// Returns a [`ShardRecoveryGuard`] that must be held for the duration of the
-    /// recovery. Dropping the guard - on success, error, or cancellation - stops
-    /// tracking and removes the progress entry.
-    pub fn start_shard_recovery(&self, shard_id: ShardId) -> ShardRecoveryGuard {
-        self.active_recoveries.start(shard_id)
+    /// Requires the shard's recovery lock, which the returned [`ShardRecoveryGuard`]
+    /// takes ownership of. Prefer [`Collection::start_shard_recovery`], which acquires
+    /// the lock and calls this.
+    ///
+    /// [`Collection::start_shard_recovery`]: crate::collection::Collection::start_shard_recovery
+    pub fn start_shard_recovery(
+        &self,
+        shard_id: ShardId,
+        recovery_lock: tokio::sync::OwnedMutexGuard<()>,
+    ) -> ShardRecoveryGuard {
+        self.active_recoveries.start(shard_id, recovery_lock)
     }
 
     pub fn get_shard_transfer_info(
@@ -575,9 +674,10 @@ impl ShardHolder {
     ) -> CollectionResult<Vec<(&'a Arc<ShardReplicaSet>, Option<&'a ShardKey>)>> {
         let mut res = Vec::new();
 
-        match shard_selector {
+        let filter_resharding = match shard_selector {
             ShardSelectorInternal::Empty => {
-                debug_assert!(false, "Do not expect empty shard selector")
+                debug_assert!(false, "Do not expect empty shard selector");
+                false
             }
             ShardSelectorInternal::All => {
                 let is_custom_sharding = match self.sharding_method {
@@ -585,33 +685,7 @@ impl ShardHolder {
                     ShardingMethod::Custom => true,
                 };
 
-                let resharding_state = self.resharding_state.read().clone();
-
                 for (&shard_id, shard) in self.shards.iter() {
-                    // Ignore a new resharding shard until it completed point migration
-                    // The shard will be marked as active at the end of the migration stage
-                    let resharding_migrating_up = resharding_state.as_ref().is_some_and(|state| {
-                        state.direction == ReshardingDirection::Up
-                            && state.shard_id == shard_id
-                            && state.stage < ReshardingStage::ReadHashRingCommitted
-                    });
-                    if resharding_migrating_up {
-                        continue;
-                    }
-
-                    // Skip shard being removed by resharding down once the write
-                    // hash ring is committed. The shard is logically gone at this
-                    // point; querying it on a remote peer that already applied
-                    // `finish_resharding` would return a "shard not found" error.
-                    let resharding_removing_down = resharding_state.as_ref().is_some_and(|state| {
-                        state.direction == ReshardingDirection::Down
-                            && state.shard_id == shard_id
-                            && state.stage >= ReshardingStage::WriteHashRingCommitted
-                    });
-                    if resharding_removing_down {
-                        continue;
-                    }
-
                     // Technically, we could skip inactive shards regardless of sharding method,
                     // as we do not expect that shard id can even become inactive on all replicas.
                     // (if it happens, means there is a bug)
@@ -624,6 +698,8 @@ impl ShardHolder {
                     let shard_key = self.shard_id_to_key_mapping.get(&shard_id);
                     res.push((shard, shard_key));
                 }
+
+                true
             }
             ShardSelectorInternal::ShardKey(shard_key) => {
                 for shard_id in self.get_shard_ids_by_key(shard_key)? {
@@ -633,6 +709,8 @@ impl ShardHolder {
                         debug_assert!(false, "Shard id {shard_id} not found")
                     }
                 }
+
+                true
             }
             ShardSelectorInternal::ShardKeys(shard_keys) => {
                 for shard_key in shard_keys {
@@ -644,6 +722,8 @@ impl ShardHolder {
                         }
                     }
                 }
+
+                true
             }
             ShardSelectorInternal::ShardKeyWithFallback(key) => {
                 let (shard_ids_to_query, used_shard_key) =
@@ -658,6 +738,8 @@ impl ShardHolder {
                         debug_assert!(false, "Shard id {shard_id} not found")
                     }
                 }
+
+                true
             }
             ShardSelectorInternal::ShardId(shard_id) => {
                 if let Some(replica_set) = self.shards.get(shard_id) {
@@ -665,8 +747,39 @@ impl ShardHolder {
                 } else {
                     return Err(shard_not_found_error(*shard_id));
                 }
+
+                // Exempt from resharding filter. This selector is used by internal per-shard
+                // operations, such as the resharding driver reading back migrated points from the
+                // new shard, which must be able to reach the shard before it becomes visible to
+                // user-facing selectors
+                false
             }
+        };
+
+        // Filter out shards that must not be queried while resharding, regardless of how they
+        // were selected above
+        if filter_resharding && let Some(state) = self.resharding_state.read().as_ref() {
+            res.retain(|(shard, _)| {
+                if state.shard_id != shard.shard_id {
+                    return true;
+                }
+
+                // Ignore a new resharding shard until it completed point migration
+                // The shard will be marked as active at the end of the migration stage
+                let resharding_migrating_up = state.direction == ReshardingDirection::Up
+                    && state.stage < ReshardingStage::ReadHashRingCommitted;
+
+                // Skip shard being removed by resharding down once the write
+                // hash ring is committed. The shard is logically gone at this
+                // point; querying it on a remote peer that already applied
+                // `finish_resharding` would return a "shard not found" error.
+                let resharding_removing_down = state.direction == ReshardingDirection::Down
+                    && state.stage >= ReshardingStage::WriteHashRingCommitted;
+
+                !resharding_migrating_up && !resharding_removing_down
+            });
         }
+
         Ok(res)
     }
 
@@ -1548,4 +1661,117 @@ pub(crate) enum ShardTransferChange {
 
 pub fn shard_not_found_error(shard_id: ShardId) -> CollectionError {
     CollectionError::not_found(format!("shard {shard_id}"))
+}
+
+/// `register_restart_transfer` is the last durable write of a shard-transfer
+/// restart (finding E). These tests pin its replay-safety: the record is never
+/// removed, so a replay after the method-updating write reports the record
+/// (rather than "no transfer"), and the update is value-idempotent.
+#[cfg(test)]
+mod restart_transfer_tests {
+    use super::*;
+
+    fn make_holder() -> (tempfile::TempDir, ShardHolder) {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = ShardHolder::new(dir.path(), ShardingMethod::Auto).unwrap();
+        (dir, holder)
+    }
+
+    // A wal-delta transfer, the only shape that gets restarted.
+    //
+    // `sync: false` and `filter: Some(..)` are chosen so the assertions below
+    // fail if restart hardcodes `sync: true` or keeps the old `filter`.
+    //
+    // `to_shard_id` must stay `None`: it is part of `ShardTransferKey`, so
+    // restart resetting a `Some` value would change the record's identity.
+    fn wal_delta_transfer() -> ShardTransfer {
+        ShardTransfer {
+            shard_id: 1,
+            to_shard_id: None,
+            from: 10,
+            to: 20,
+            sync: false,
+            method: Some(ShardTransferMethod::WalDelta),
+            filter: Some(segment::types::Filter::default()),
+        }
+    }
+
+    #[test]
+    fn test_register_restart_transfer_absent_is_none() {
+        let (_dir, holder) = make_holder();
+        let key = wal_delta_transfer().key();
+
+        // No record: a restart of a transfer that isn't registered is a
+        // stale-duplicate signal, reported as None.
+        let result = holder
+            .register_restart_transfer(&key, ShardTransferMethod::Snapshot)
+            .unwrap();
+        assert_eq!(
+            result, None,
+            "restart of an absent transfer must return None"
+        );
+    }
+
+    #[test]
+    fn test_register_restart_transfer_updates_method_in_place() {
+        let (_dir, holder) = make_holder();
+        let transfer = wal_delta_transfer();
+        let key = transfer.key();
+        holder
+            .register_start_shard_transfer(transfer.clone())
+            .unwrap();
+
+        let updated = holder
+            .register_restart_transfer(&key, ShardTransferMethod::Snapshot)
+            .unwrap()
+            .expect("restart must return the updated record");
+
+        assert_eq!(updated.method, Some(ShardTransferMethod::Snapshot));
+        assert_eq!(updated.sync, transfer.sync, "sync flag must be preserved");
+        assert_eq!(updated.to_shard_id, None);
+        assert_eq!(updated.filter, None, "filter must be reset");
+        assert_eq!(updated.from, transfer.from);
+        assert_eq!(updated.to, transfer.to);
+        assert_eq!(updated.shard_id, transfer.shard_id);
+
+        // The record is replaced in place — still exactly one transfer, now with
+        // the new method (never removed, so a replay can always find it).
+        let transfers = holder.shard_transfers.read();
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(
+            transfers.iter().next().unwrap().method,
+            Some(ShardTransferMethod::Snapshot),
+        );
+    }
+
+    #[test]
+    fn test_register_restart_transfer_replay_is_noop() {
+        let (dir, holder) = make_holder();
+        let transfer = wal_delta_transfer();
+        let key = transfer.key();
+        holder
+            .register_start_shard_transfer(transfer.clone())
+            .unwrap();
+
+        // Apply the restart, then replay it (as a crash after the method write
+        // would). The replay must report the record (not None) and leave the set
+        // unchanged — a single, idempotent no-op.
+        holder
+            .register_restart_transfer(&key, ShardTransferMethod::Snapshot)
+            .unwrap();
+
+        // Reopen the holder from disk, as a crash-restart would, so the replay
+        // runs against the reloaded state rather than the same in-memory value.
+        drop(holder);
+        let holder = ShardHolder::new(dir.path(), ShardingMethod::Auto).unwrap();
+
+        let replay = holder
+            .register_restart_transfer(&key, ShardTransferMethod::Snapshot)
+            .unwrap()
+            .expect("replay must still find the record, not treat it as absent");
+
+        assert_eq!(replay.method, Some(ShardTransferMethod::Snapshot));
+        assert_eq!(replay.sync, transfer.sync);
+        assert_eq!(holder.shard_transfers.read().len(), 1);
+    }
 }

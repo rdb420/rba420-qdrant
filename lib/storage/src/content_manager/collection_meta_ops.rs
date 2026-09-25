@@ -1,13 +1,20 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 use std::collections::BTreeMap;
 
-use collection::config::{CollectionConfigInternal, CollectionParams, ShardingMethod};
+use collection::config::{
+    CollectionConfigInternal, CollectionParams, PayloadStorageParams, ShardingMethod,
+};
 use collection::operations::config_diff::{
     CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
     WalConfigDiff,
 };
 use collection::operations::types::{
-    SparseVectorParams, SparseVectorsConfig, VectorsConfig, VectorsConfigDiff,
+    SparseVectorParams, SparseVectorsConfig, VectorParams, VectorsConfig, VectorsConfigDiff,
 };
+use collection::operations::validation;
 use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
@@ -17,7 +24,7 @@ use schemars::JsonSchema;
 use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use segment::types::{
     Payload, PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
-    VectorNameBuf,
+    VectorNameBuf, VectorsConfigDefaults,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -25,7 +32,7 @@ use validator::Validate;
 
 // Re-export staging types when the feature is enabled
 #[cfg(feature = "staging")]
-pub use super::staging::TestSlowDown;
+pub use super::staging::{TestSlowDown, TestTransientError};
 use crate::content_manager::errors::{StorageError, StorageResult};
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
 
@@ -142,6 +149,7 @@ pub struct CreateCollection {
     #[serde(default)]
     #[validate(range(min = 1))]
     pub write_consistency_factor: Option<u32>,
+    /// Deprecated: use `payload.memory` instead.
     /// If true - point's payload will not be stored in memory.
     /// It will be read from the disk every time it is requested.
     /// This setting saves RAM by (slightly) increasing the response time.
@@ -149,7 +157,12 @@ pub struct CreateCollection {
     ///
     /// Default: true
     #[serde(default)]
+    #[deprecated(since = "1.19.0", note = "Use `payload.memory` instead")]
     pub on_disk_payload: Option<bool>,
+    /// Configuration of the payload storage
+    #[serde(default)]
+    #[validate(nested)]
+    pub payload: Option<PayloadStorageParams>,
     /// Custom params for HNSW index. If none - values from service configuration file are used.
     #[validate(nested)]
     pub hnsw_config: Option<HnswConfigDiff>,
@@ -180,6 +193,43 @@ pub struct CreateCollection {
     pub metadata: Option<Payload>,
 }
 
+/// Fill exactly one placement level, by precedence: request `memory`, request legacy `on_disk`,
+/// default `memory`, default `on_disk`. Filling a lower level alongside a higher one would cause
+/// spurious `memory`-vs-legacy mismatch warnings at resolution time.
+pub fn apply_vector_placement_defaults(
+    params: &mut VectorParams,
+    defaults: &VectorsConfigDefaults,
+) {
+    if params.memory.is_some() || params.on_disk.is_some() {
+        return;
+    }
+
+    let &VectorsConfigDefaults { on_disk, memory } = defaults;
+
+    if memory.is_some() {
+        params.memory = memory;
+    } else {
+        params.on_disk = on_disk;
+    }
+}
+
+/// Service-level `payload.memory` default applies unless the request specifies `payload.memory`
+/// or the legacy `on_disk_payload` flag.
+pub fn apply_payload_placement_defaults(
+    payload: Option<PayloadStorageParams>,
+    on_disk_payload: Option<bool>,
+    defaults: Option<PayloadStorageParams>,
+) -> Option<PayloadStorageParams> {
+    if on_disk_payload.is_some() {
+        return payload;
+    }
+
+    match (defaults, payload) {
+        (Some(defaults), Some(payload)) => Some(defaults.update(&payload)),
+        (defaults, payload) => payload.or(defaults),
+    }
+}
+
 /// Operation for creating new collection and (optionally) specify index params
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +244,17 @@ impl CreateCollectionOperation {
         collection_name: String,
         create_collection: CreateCollection,
     ) -> StorageResult<Self> {
+        // Run the derived `Validate` checks here instead of relying on the API
+        // layer: only the REST extractor validates the deserialized request,
+        // while gRPC validates the proto message, whose constraints can lag
+        // behind the internal ones (e.g. rejecting `memory: pinned` for dense
+        // vectors and payload storage). Constructing the operation is the
+        // common chokepoint for all API paths, before the operation is
+        // proposed to consensus.
+        create_collection.validate().map_err(|errs| {
+            StorageError::bad_input(validation::label_errors("Validation error in body", &errs))
+        })?;
+
         // Apply the same vector-name validation that the
         // `PUT /collections/{name}/vectors/{vector_name}` endpoint enforces
         // (length 0..=200, no filesystem-unsafe characters), so both creation
@@ -253,6 +314,10 @@ impl CreateCollectionOperation {
         self.distribution.is_some()
     }
 
+    pub fn distribution(&self) -> Option<&ShardDistributionProposal> {
+        self.distribution.as_ref()
+    }
+
     pub fn take_distribution(&mut self) -> Option<ShardDistributionProposal> {
         self.distribution.take()
     }
@@ -276,6 +341,7 @@ pub struct UpdateCollection {
     #[validate(nested)]
     pub optimizers_config: Option<OptimizersConfigDiff>, // TODO: Allow updates for other configuration params as well
     /// Collection base params. If none - it is left unchanged.
+    #[validate(nested)]
     pub params: Option<CollectionParamsDiff>,
     /// HNSW parameters to update for the collection index. If none - it is left unchanged.
     #[validate(nested)]
@@ -290,7 +356,7 @@ pub struct UpdateCollection {
     #[validate(nested)]
     pub strict_mode_config: Option<StrictModeConfig>,
     /// Metadata to update for the collection. If provided, this will merge with existing metadata.
-    /// To remove metadata, set it to an empty object.
+    /// Individual keys can be removed by setting their value to `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Payload>,
 }
@@ -301,7 +367,7 @@ pub struct UpdateCollection {
 pub struct UpdateCollectionOperation {
     pub collection_name: String,
     pub update_collection: UpdateCollection,
-    shard_replica_changes: Option<Vec<replica_set::Change>>,
+    pub shard_replica_changes: Option<Vec<replica_set::Change>>,
 }
 
 impl UpdateCollectionOperation {
@@ -322,12 +388,24 @@ impl UpdateCollectionOperation {
         }
     }
 
-    pub fn new(collection_name: String, update_collection: UpdateCollection) -> Self {
-        Self {
+    pub fn new(
+        collection_name: String,
+        update_collection: UpdateCollection,
+    ) -> StorageResult<Self> {
+        // API-layer-independent validation, see `CreateCollectionOperation::new`.
+        update_collection.validate().map_err(|errs| {
+            StorageError::bad_input(validation::label_errors("Validation error in body", &errs))
+        })?;
+
+        Ok(Self {
             collection_name,
             update_collection,
             shard_replica_changes: None,
-        }
+        })
+    }
+
+    pub fn has_shard_replica_changes(&self) -> bool {
+        self.shard_replica_changes.is_some()
     }
 
     pub fn take_shard_replica_changes(&mut self) -> Option<Vec<replica_set::Change>> {
@@ -472,6 +550,9 @@ pub enum CollectionMetaOperations {
     /// Introduce artificial delay to a specific peer node
     #[cfg(feature = "staging")]
     TestSlowDown(TestSlowDown),
+    /// Simulate a transient consensus failure on a specific peer node
+    #[cfg(feature = "staging")]
+    TestTransientError(TestTransientError),
 }
 
 /// Use config of the existing collection to generate a create collection operation
@@ -498,6 +579,7 @@ impl From<CollectionConfigInternal> for CreateCollection {
             read_fan_out_factor: _,
             read_fan_out_delay_ms: _,
             on_disk_payload,
+            payload,
             sparse_vectors,
         } = params;
 
@@ -507,7 +589,8 @@ impl From<CollectionConfigInternal> for CreateCollection {
             sharding_method,
             replication_factor: Some(replication_factor.get()),
             write_consistency_factor: Some(write_consistency_factor.get()),
-            on_disk_payload: Some(on_disk_payload),
+            on_disk_payload,
+            payload,
             hnsw_config: Some(hnsw_config.into()),
             wal_config: Some(wal_config.into()),
             optimizers_config: Some(optimizer_config.into()),

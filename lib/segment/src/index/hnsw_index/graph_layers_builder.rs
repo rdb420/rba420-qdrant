@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::cmp::{max, min};
-use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -10,6 +9,7 @@ use common::bitvec::BitSliceExt;
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::fs::{atomic_save, atomic_save_bin};
 use common::types::{PointOffsetType, ScoredPointOffset};
+use common::universal_io::MmapFs;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use rand::distr::Uniform;
 use rand::{Rng, RngExt};
@@ -23,7 +23,7 @@ use crate::index::hnsw_index::entry_points::EntryPoints;
 #[cfg(test)]
 use crate::index::hnsw_index::graph_layers::SearchAlgorithm;
 use crate::index::hnsw_index::graph_layers::{GraphLayers, GraphLayersBase};
-use crate::index::hnsw_index::graph_links::serialize_graph_links;
+use crate::index::hnsw_index::graph_links::{GraphLinksResidency, serialize_graph_links};
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
 
@@ -219,18 +219,21 @@ impl GraphLayersBuilder {
         let links_path = GraphLayers::get_links_path(path, format_param.as_format());
 
         let edges = Self::links_layers_to_edges(self.links_layers);
-        let links;
-        if on_disk {
-            // Save memory by serializing directly to disk, then re-loading as mmap.
-            atomic_save(&links_path, |writer| {
-                serialize_graph_links(edges, format_param, self.hnsw_m, writer)
-            })?;
-            links = GraphLinks::load_from_mmap(&links_path, format_param.as_format())?;
+        // Save memory by serializing directly to disk, then re-loading as mmap.
+        atomic_save(&links_path, |writer| {
+            serialize_graph_links(edges, format_param, self.hnsw_m, writer)
+        })?;
+        // Keep the links cold (lazily on disk) when configured so; otherwise
+        // pre-populate the page cache (cheap: the pages were just written).
+        // Never pin the links in heap here, so that the just-built index has
+        // the same, single-copy residency as one loaded from disk.
+        let residency = if on_disk {
+            GraphLinksResidency::Cold
         } else {
-            // Since we'll keep it in the RAM anyway, we can afford to build in the RAM too.
-            links = GraphLinks::new_from_edges(edges, format_param, self.hnsw_m)?;
-            atomic_save(&links_path, |writer| writer.write_all(links.as_bytes()))?;
-        }
+            GraphLinksResidency::Cached
+        };
+        let links =
+            GraphLinks::load_universal(&MmapFs, &links_path, format_param.as_format(), residency)?;
 
         let entry_points = self.entry_points.into_inner();
 
@@ -388,8 +391,18 @@ impl GraphLayersBuilder {
     {
         let distribution = Uniform::new(0.0, 1.0).unwrap();
         let sample: f64 = rng.sample(distribution);
-        let picked_level = -sample.ln() * self.level_factor;
-        picked_level.round() as usize
+        Self::level_from_sample(sample, self.level_factor)
+    }
+
+    /// Map a uniform `[0, 1)` sample to a geometric level.
+    ///
+    /// `Uniform::new(0.0, 1.0)` is half-open, so `sample` can be exactly `0.0`.
+    /// `ln(0.0)` is `-inf`, and `(-(-inf) * factor).round() as usize` saturates
+    /// to `usize::MAX`, which then makes `set_levels` allocate unboundedly.
+    /// Clamp to the smallest positive `f64` so the level stays bounded.
+    fn level_from_sample(sample: f64, level_factor: f64) -> usize {
+        let sample = sample.max(f64::MIN_POSITIVE);
+        (-sample.ln() * level_factor).round() as usize
     }
 
     pub(crate) fn get_point_level(&self, point_id: PointOffsetType) -> usize {
@@ -603,7 +616,7 @@ mod tests {
     use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
     use itertools::Itertools;
     use rand::SeedableRng;
-    use rand::prelude::StdRng;
+    use rand::prelude::SmallRng;
     use rstest::rstest;
 
     use super::*;
@@ -614,6 +627,20 @@ mod tests {
     use crate::vector_storage::{DEFAULT_STOPPED, VectorStorageRead as _};
 
     const M: usize = 8;
+
+    #[test]
+    fn get_random_layer_handles_zero_sample() {
+        // A zero uniform sample used to make ln(0) = -inf and saturate the
+        // level to usize::MAX; the clamp must keep it bounded.
+        let level_factor = 1.0 / (M as f64).ln();
+        let level = GraphLayersBuilder::level_from_sample(0.0, level_factor);
+        assert!(
+            level < 1024,
+            "zero sample produced an unbounded level: {level}"
+        );
+        // A normal mid-range sample still yields a small level.
+        assert!(GraphLayersBuilder::level_from_sample(0.5, level_factor) < 1024);
+    }
 
     #[cfg(not(windows))]
     fn parallel_graph_build<R>(
@@ -713,7 +740,7 @@ mod tests {
         let num_vectors = 1000;
         let dim = 8;
 
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
 
         // let (vector_holder, graph_layers_builder) =
         //     create_graph_layer::<M, _>(num_vectors, dim, false, &mut rng);
@@ -769,15 +796,15 @@ mod tests {
             format.with_param_for_tests(vector_holder.graph_links_vectors().as_ref()),
         );
 
-        let scorer = vector_holder.scorer(query);
+        let mut scorer = vector_holder.scorer(query);
         let ef = 16;
         let graph_search = graph
             .search(
                 top,
                 ef,
                 SearchAlgorithm::Hnsw,
-                scorer,
-                None,
+                &mut scorer,
+                graph.unfiltered_entry_point(),
                 &DEFAULT_STOPPED,
             )
             .unwrap();
@@ -794,8 +821,8 @@ mod tests {
         let num_vectors = 1000;
         let dim = 8;
 
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut rng2 = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mut rng2 = SmallRng::seed_from_u64(42);
 
         let (vector_holder, graph_layers_builder) = create_graph_layer(
             num_vectors,
@@ -882,15 +909,15 @@ mod tests {
             format.with_param_for_tests(vector_holder.graph_links_vectors().as_ref()),
         );
 
-        let scorer = vector_holder.scorer(query);
+        let mut scorer = vector_holder.scorer(query);
         let ef = 16;
         let graph_search = graph
             .search(
                 top,
                 ef,
                 SearchAlgorithm::Hnsw,
-                scorer,
-                None,
+                &mut scorer,
+                graph.unfiltered_entry_point(),
                 &DEFAULT_STOPPED,
             )
             .unwrap();
@@ -908,7 +935,7 @@ mod tests {
         const EF_CONSTRUCT: usize = 64;
         const USE_HEURISTIC: bool = true;
 
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
 
         let vector_holder = TestRawScorerProducer::new(
             DIM,
@@ -966,7 +993,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         const DIM: usize = 4;
-        let mut rng = StdRng::seed_from_u64(42);
+        let mut rng = SmallRng::seed_from_u64(42);
 
         // Build a one-point graph the normal way. `link_new_point` sees an
         // empty entry-points list, takes the "new empty entry" branch, and

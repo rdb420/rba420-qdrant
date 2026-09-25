@@ -7,7 +7,7 @@ use common::storage_version::StorageVersion;
 use common::types::PointOffsetType;
 use parking_lot::{RwLockUpgradableReadGuard, RwLockWriteGuard};
 use segment::common::operation_error::OperationResult;
-use segment::entry::ReadSegmentEntry as _;
+use segment::entry::StorageSegmentEntry as _;
 use segment::segment::SegmentVersion;
 use segment::types::SegmentConfig;
 
@@ -48,7 +48,7 @@ impl SegmentHolder {
         let hw_counter = HardwareCounterCell::disposable();
 
         // Create temporary appendable segment to direct all proxy writes into
-        let tmp_segment = segments_lock.build_tmp_segment(
+        let (tmp_segment, tmp_token) = segments_lock.build_tmp_segment(
             segments_path,
             segment_config,
             payload_index_schema,
@@ -75,6 +75,9 @@ impl SegmentHolder {
         // If this ends up not being saved due to a crash, the segment will not be used
         match &tmp_segment {
             LockedSegment::Original(segment) => {
+                // Register the temp segment before saving its version, so it exists in the manifest
+                // before it can receive proxied writes.
+                segments_lock.sync_segment_manifest(Some(tmp_token))?;
                 let segment_path = &segment.read().segment_path;
                 SegmentVersion::save(segment_path)?;
             }
@@ -146,13 +149,14 @@ impl SegmentHolder {
             }
         };
 
-        // propagate changes to wrapped segment with segment holder read lock
-        {
-            if let Err(err) = proxy_segment.write().propagate_to_wrapped() {
-                log::error!(
-                    "Propagating proxy segment {segment_id} changes to wrapped segment failed, ignoring: {err}",
-                );
-            }
+        // Propagate changes to wrapped segment with segment holder read lock. On failure keep the
+        // proxy installed rather than unwrapping into a segment that never got the changes;
+        // `unproxy_all_segments` retries the propagation for every proxy left behind.
+        if let Err(err) = proxy_segment.write().propagate_to_wrapped() {
+            log::error!(
+                "Propagating proxy segment {segment_id} changes to wrapped segment failed: {err}",
+            );
+            return Err(segments_lock);
         }
 
         let mut write_segments = RwLockUpgradableReadGuard::upgrade(segments_lock);
@@ -178,16 +182,21 @@ impl SegmentHolder {
         // so it is important, that we don't block reads while doing this.
 
         // propagate changes to wrapped segment with segment holder read lock
-        proxies
-            .iter()
-            .filter_map(|(segment_id, proxy_segment)| match proxy_segment {
-                LockedSegment::Proxy(proxy_segment) => Some((segment_id, proxy_segment)),
-                LockedSegment::Original(_) => None,
-            }).for_each(|(proxy_id, proxy_segment)| {
-            if let Err(err) = proxy_segment.write().propagate_to_wrapped() {
-                log::error!("Propagating proxy segment {proxy_id} changes to wrapped segment failed, ignoring: {err}");
-            }
+        let proxies_to_propagate = proxies.iter().filter_map(|(id, segment)| match segment {
+            LockedSegment::Proxy(proxy_segment) => Some((id, proxy_segment)),
+            LockedSegment::Original(_) => None,
         });
+        for (proxy_id, proxy_segment) in proxies_to_propagate {
+            // Unwrapping a proxy whose changes did not reach the wrapped segment loses them for
+            // good, so bail out before touching the holder. Every proxy stays installed and keeps
+            // serving its changes, and the temp segment they write into is left in place.
+            if let Err(err) = proxy_segment.write().propagate_to_wrapped() {
+                log::error!(
+                    "Propagating proxy segment {proxy_id} changes to wrapped segment failed: {err}",
+                );
+                return Err(err);
+            }
+        }
 
         // Swap out each proxy with wrapped segment once changes are propagated
         let mut write_segments = RwLockUpgradableReadGuard::upgrade(segments_lock);

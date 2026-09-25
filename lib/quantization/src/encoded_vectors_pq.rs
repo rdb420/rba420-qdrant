@@ -15,6 +15,7 @@ use common::fs::atomic_save_json;
 use common::mmap::MmapFlusher;
 use common::typelevel::True;
 use common::types::PointOffsetType;
+use common::universal_io::{UioResult, UniversalReadFs, read_json_via};
 use fs_err as fs;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -61,7 +62,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
     /// * `storage_builder` - encoding result storage builder
     /// * `vector_parameters` - parameters of original vector data (dimension, distance, etc)
     /// * `chunk_size` - Max size of f32 chunk that replaced by centroid index (in original vector dimension)
-    /// * `max_threads` - Max allowed threads for kmeans and encodind process
+    /// * `max_kmeans_threads` - Max allowed threads for kmeans and encodind process
     /// * `stopped` - Atomic bool that indicates if encoding should be stopped
     #[allow(clippy::too_many_arguments)]
     pub fn encode<'a>(
@@ -140,9 +141,12 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
         }
     }
 
-    pub fn load(encoded_vectors: TStorage, meta_path: &Path) -> std::io::Result<Self> {
-        let contents = fs::read_to_string(meta_path)?;
-        let metadata: Metadata = serde_json::from_str(&contents)?;
+    pub fn load<Fs: UniversalReadFs>(
+        fs: &Fs,
+        encoded_vectors: TStorage,
+        meta_path: &Path,
+    ) -> UioResult<Self> {
+        let metadata: Metadata = read_json_via(fs, meta_path)?;
         let result = Self {
             encoded_vectors,
             metadata,
@@ -358,9 +362,8 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
         }
 
         // find random subset of data as random non-intersected indexes
-        let permutor = permutation_iterator::Permutor::new(count as u64);
         let mut selected_vectors: Vec<usize> =
-            permutor.map(|i| i as usize).take(sample_size).collect();
+            rand::seq::index::sample(&mut rand::rng(), count, sample_size).into_vec();
         if stopped.load(Ordering::Relaxed) {
             return Err(EncodingError::Stopped);
         }
@@ -536,11 +539,12 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
         EncodedQueryPQ { lut }
     }
 
-    fn iter_batch(
+    fn for_each_batch(
         &self,
         offsets: &[PointOffsetType],
-    ) -> impl Iterator<Item = (usize, Cow<'_, [u8]>)> {
-        self.encoded_vectors.iter_batch(offsets)
+        callback: impl FnMut(usize, Cow<'_, [u8]>),
+    ) {
+        self.encoded_vectors.for_each_batch(offsets, callback)
     }
 
     fn score(

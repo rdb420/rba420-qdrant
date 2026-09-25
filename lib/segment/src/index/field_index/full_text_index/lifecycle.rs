@@ -4,49 +4,51 @@ use std::path::PathBuf;
 use common::bitvec::BitSlice;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use common::universal_io::MmapFs;
+use common::universal_io::{MmapFs, Populate};
+use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::immutable_text_index::ImmutableFullTextIndex;
-use super::mmap_text_index::{FullTextMmapIndexBuilder, MmapFullTextIndex};
+use super::inverted_index::ARRAY_BOUNDARY_SENTINEL;
 use super::mutable_text_index::MutableFullTextIndex;
+use super::on_disk_text_index::{FullTextMmapIndexBuilder, OnDiskFullTextIndex};
+use super::tokenizers::Tokenizer;
 use super::{FullTextGridstoreIndexBuilder, FullTextIndex};
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::index::TextIndexParams;
 use crate::index::field_index::{FieldIndexBuilderTrait, PayloadFieldIndex, ValueIndexer};
 use crate::index::payload_config::IndexMutability;
+use crate::types::Memory;
 
 impl FullTextIndex {
     pub fn new_mmap(
         path: PathBuf,
         config: TextIndexParams,
-        is_on_disk: bool,
+        memory: Memory,
         deleted_points: &BitSlice,
     ) -> OperationResult<Option<Self>> {
-        // Low-memory mode downgrades the in-RAM `Immutable` wrapper to the
-        // pure-mmap variant at load time. Files are shared between variants;
-        // the persisted `is_on_disk` flag in `mmap_index` is untouched.
-        let effective_is_on_disk =
-            is_on_disk || common::low_memory::low_memory_mode().prefer_disk();
+        // Low-memory mode degrades the placement at load time (pinned falls back to the
+        // pure-mmap variant). Files are shared between variants; the persisted
+        // configuration is untouched.
+        let memory = memory.clamp_to_low_memory();
 
-        let Some(mmap_index) =
-            MmapFullTextIndex::open(&MmapFs, path, config, effective_is_on_disk, deleted_points)?
+        let populate = Populate::from(memory.populate_on_open());
+        let Some(on_disk_index) =
+            OnDiskFullTextIndex::open(&MmapFs, path, config, populate, deleted_points)?
         else {
             return Ok(None);
         };
 
-        let index = if effective_is_on_disk {
-            // Use on mmap directly
-            Some(Self::Mmap(Box::new(mmap_index)))
-        } else {
+        let index = if memory.is_heap() {
             // Load into RAM, use mmap as backing storage
-            Some(Self::Immutable(ImmutableFullTextIndex::open_mmap(
-                mmap_index,
-            )?))
+            Self::Immutable(ImmutableFullTextIndex::load_from_on_disk(on_disk_index)?)
+        } else {
+            // Use on-disk directly
+            Self::OnDisk(on_disk_index)
         };
-        Ok(index)
+        Ok(Some(index))
     }
 
     pub fn new_gridstore(
@@ -65,8 +67,8 @@ impl FullTextIndex {
                 debug_assert!(false, "Immutable index should be initialized before use");
                 Ok(())
             }
-            Self::Mmap(_) => {
-                debug_assert!(false, "Mmap index should be initialized before use");
+            Self::OnDisk(_) => {
+                debug_assert!(false, "On-disk index should be initialized before use");
                 Ok(())
             }
         }
@@ -86,6 +88,49 @@ impl FullTextIndex {
         config: TextIndexParams,
     ) -> FullTextGridstoreIndexBuilder {
         FullTextGridstoreIndexBuilder::new(dir, config)
+    }
+
+    /// Tokenize a point's text values into the token stream the index is built
+    /// from, in document order.
+    ///
+    /// With phrase matching on, a sentinel separates the values of an array, so
+    /// that no phrase matches across two of them.
+    pub(super) fn tokenize_document<'a>(
+        tokenizer: &'a Tokenizer,
+        phrase_matching: bool,
+        values: &'a [String],
+    ) -> Vec<Cow<'a, str>> {
+        let insert_boundaries = phrase_matching && values.len() > 1;
+
+        let mut str_tokens: Vec<Cow<str>> =
+            Vec::with_capacity((values.len() * 2).saturating_sub(1));
+        for (i, value) in values.iter().enumerate() {
+            if insert_boundaries && i > 0 {
+                str_tokens.push(Cow::Borrowed(ARRAY_BOUNDARY_SENTINEL));
+            }
+            tokenizer.tokenize_doc(value, |token| {
+                str_tokens.push(token);
+            });
+        }
+
+        str_tokens
+    }
+
+    /// Encode a point's tokens as the document the storage holds.
+    ///
+    /// Phrase matching needs them in the order they were written; without it
+    /// only membership matters, so they are stored sorted and deduplicated.
+    pub(super) fn serialize_stored_document(
+        str_tokens: Vec<Cow<str>>,
+        phrase_matching: bool,
+    ) -> OperationResult<Vec<u8>> {
+        let tokens = if phrase_matching {
+            str_tokens
+        } else {
+            str_tokens.into_iter().sorted().dedup().collect()
+        };
+
+        Self::serialize_document(tokens)
     }
 
     pub(super) fn serialize_document(tokens: Vec<Cow<str>>) -> OperationResult<Vec<u8>> {
@@ -115,7 +160,7 @@ impl FullTextIndex {
         match self {
             FullTextIndex::Mutable(_) => IndexMutability::Mutable,
             FullTextIndex::Immutable(_) => IndexMutability::Immutable,
-            FullTextIndex::Mmap(_) => IndexMutability::Immutable,
+            FullTextIndex::OnDisk(_) => IndexMutability::Immutable,
         }
     }
 
@@ -124,7 +169,7 @@ impl FullTextIndex {
             // Mutable / Immutable keep their inverted index fully in RAM —
             // there is nothing to populate.
             Self::Mutable(_) | Self::Immutable(_) => Ok(()),
-            Self::Mmap(index) => index.populate(),
+            Self::OnDisk(index) => index.populate(),
         }
     }
 
@@ -132,7 +177,7 @@ impl FullTextIndex {
         match self {
             Self::Mutable(index) => index.clear_cache(),
             Self::Immutable(index) => index.clear_cache(),
-            Self::Mmap(index) => index.clear_cache(),
+            Self::OnDisk(index) => index.clear_cache(),
         }
     }
 
@@ -140,7 +185,7 @@ impl FullTextIndex {
         match self {
             Self::Mutable(index) => index.files(),
             Self::Immutable(index) => index.files(),
-            Self::Mmap(index) => index.files(),
+            Self::OnDisk(index) => index.files(),
         }
     }
 
@@ -148,7 +193,7 @@ impl FullTextIndex {
         match self {
             Self::Mutable(_) => Vec::new(),
             Self::Immutable(index) => index.immutable_files(),
-            Self::Mmap(index) => index.immutable_files(),
+            Self::OnDisk(index) => index.immutable_files(),
         }
     }
 }
@@ -167,8 +212,8 @@ impl ValueIndexer for FullTextIndex {
             Self::Immutable(_) => Err(OperationError::service_error(
                 "Cannot add values to immutable text index",
             )),
-            Self::Mmap(_) => Err(OperationError::service_error(
-                "Cannot add values to mmap text index",
+            Self::OnDisk(_) => Err(OperationError::service_error(
+                "Cannot add values to on-disk text index",
             )),
         }
     }
@@ -181,7 +226,7 @@ impl ValueIndexer for FullTextIndex {
         match self {
             FullTextIndex::Mutable(index) => index.remove_point(id)?,
             FullTextIndex::Immutable(index) => index.remove_point(id),
-            FullTextIndex::Mmap(index) => index.remove_point(id),
+            FullTextIndex::OnDisk(index) => index.remove_point(id),
         }
         Ok(())
     }
@@ -192,7 +237,7 @@ impl PayloadFieldIndex for FullTextIndex {
         match self {
             Self::Mutable(index) => index.wipe(),
             Self::Immutable(index) => index.wipe(),
-            Self::Mmap(index) => index.wipe(),
+            Self::OnDisk(index) => index.wipe(),
         }
     }
 
@@ -200,7 +245,7 @@ impl PayloadFieldIndex for FullTextIndex {
         match self {
             Self::Mutable(index) => index.flusher(),
             Self::Immutable(index) => index.flusher(),
-            Self::Mmap(index) => index.flusher(),
+            Self::OnDisk(index) => index.flusher(),
         }
     }
 

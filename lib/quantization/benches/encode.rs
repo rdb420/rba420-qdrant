@@ -1,18 +1,18 @@
 use std::sync::atomic::AtomicBool;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use permutation_iterator::Permutor;
 use quantization::encoded_storage::TestEncodedStorageBuilder;
 use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
 use quantization::encoded_vectors_u8::{self, EncodedVectorsU8, ScalarQuantizationMethod};
 use rand::RngExt;
+use rand::rngs::SmallRng;
 
 fn encode_dot_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode dot");
 
     let vectors_count = 100_000;
     let vector_dim = 1024;
-    let mut rng = rand::rng();
+    let mut rng = rand::make_rng::<SmallRng>();
     let mut list: Vec<f32> = Vec::new();
     for _ in 0..vectors_count {
         let vector: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
@@ -74,8 +74,11 @@ fn encode_dot_bench(c: &mut Criterion) {
         });
     });
 
-    let permutor = Permutor::new(vectors_count as u64);
-    let permutation: Vec<u32> = permutor.map(|i| i as u32).collect();
+    let permutation: Vec<u32> =
+        rand::seq::index::sample(&mut rand::rng(), vectors_count, vectors_count)
+            .into_iter()
+            .map(|i| i as u32)
+            .collect();
 
     #[cfg(target_arch = "x86_64")]
     group.bench_function("score random access u8 avx", |b| {
@@ -116,7 +119,7 @@ fn encode_l1_bench(c: &mut Criterion) {
 
     let vectors_count = 100_000;
     let vector_dim = 1024;
-    let mut rng = rand::rng();
+    let mut rng = rand::make_rng::<SmallRng>();
     let mut list: Vec<f32> = Vec::new();
     for _ in 0..vectors_count {
         let vector: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
@@ -178,8 +181,11 @@ fn encode_l1_bench(c: &mut Criterion) {
         });
     });
 
-    let permutor = Permutor::new(vectors_count as u64);
-    let permutation: Vec<u32> = permutor.map(|i| i as u32).collect();
+    let permutation: Vec<u32> =
+        rand::seq::index::sample(&mut rand::rng(), vectors_count, vectors_count)
+            .into_iter()
+            .map(|i| i as u32)
+            .collect();
 
     #[cfg(target_arch = "x86_64")]
     group.bench_function("score random access u8 avx", |b| {

@@ -11,6 +11,7 @@ use tempfile::Builder;
 const NUM_POINTS: usize = 2000;
 const ATTEMPTS: usize = 100;
 
+#[cfg_attr(target_os = "windows", ignore = "slow on Windows, not OS-specific")]
 #[test]
 fn test_filtering_context_consistency() {
     let is_stopped = AtomicBool::new(false);
@@ -35,7 +36,7 @@ fn test_filtering_context_consistency() {
                 &filter,
                 &is_stopped,
                 &hw_counter,
-                DeferredBehavior::Exclude,
+                DeferredBehavior::VisibleOnly,
             )
         });
         let read_by_stream_res = segment.with_view(|view| {
@@ -45,7 +46,7 @@ fn test_filtering_context_consistency() {
                 &filter,
                 &is_stopped,
                 &hw_counter,
-                DeferredBehavior::Exclude,
+                DeferredBehavior::VisibleOnly,
             )
         });
 

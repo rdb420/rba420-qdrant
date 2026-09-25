@@ -1,3 +1,7 @@
+// Deprecated storage placement params (`on_disk`, `always_ram`, `on_disk_payload`) are still
+// handled here for backward compatibility with the new `memory` parameter
+#![allow(deprecated)]
+
 /// Looks for segments having a mismatch between configured and actual parameters
 ///
 /// For example, a user may change the HNSW parameters for a collection. A segment that was already
@@ -16,7 +20,7 @@ mod tests {
     use segment::types::{
         CompressionRatio, HnswConfig, HnswGlobalConfig, Indexes, ProductQuantization,
         ProductQuantizationConfig, QuantizationConfig, ScalarQuantizationConfig, ScalarType,
-        SegmentConfig, VectorNameBuf, VectorStorageType,
+        SegmentConfig, VectorNameBuf,
     };
     use shard::operations::optimization::OptimizerThresholds;
     use shard::optimizers::config::{
@@ -31,55 +35,62 @@ mod tests {
     use crate::collection_manager::holders::segment_holder::SegmentHolder;
     use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
 
-    fn dense_map_from_segment(
+    fn dense_config(
         segment_config: &SegmentConfig,
-        overrides: &HashMap<VectorNameBuf, DenseVectorOptimizerConfig>,
-    ) -> HashMap<VectorNameBuf, DenseVectorOptimizerConfig> {
-        segment_config
-            .vector_data
-            .keys()
-            .map(|name| {
-                let cfg = overrides
-                    .get(name)
-                    .cloned()
-                    .unwrap_or(DenseVectorOptimizerConfig {
-                        on_disk: None,
-                        hnsw_config: HnswConfig::default(),
-                        quantization_config: None,
-                    });
-                (name.clone(), cfg)
-            })
-            .collect()
+        name: &str,
+        on_disk: Option<bool>,
+        hnsw_config: HnswConfig,
+        quantization_config: Option<QuantizationConfig>,
+    ) -> DenseVectorOptimizerConfig {
+        let vector_data = &segment_config.vector_data[name];
+        DenseVectorOptimizerConfig {
+            size: vector_data.size,
+            distance: vector_data.distance,
+            on_disk,
+            memory: None,
+            hnsw_config,
+            quantization_config,
+            multivector_config: vector_data.multivector_config,
+            datatype: vector_data.datatype,
+        }
     }
 
     fn segment_optimizer_config(
         segment_config: &SegmentConfig,
         dense_overrides: &HashMap<VectorNameBuf, DenseVectorOptimizerConfig>,
     ) -> SegmentOptimizerConfig {
-        let dense_vector = dense_map_from_segment(segment_config, dense_overrides);
-        let mut base_vector_data = segment_config.vector_data.clone();
-        for (name, cfg) in &dense_vector {
-            if let Some(vector_data) = base_vector_data.get_mut(name)
-                && let Some(on_disk) = cfg.on_disk
-            {
-                vector_data.storage_type = if on_disk {
-                    VectorStorageType::Mmap
-                } else {
-                    VectorStorageType::Memory
+        let dense_vectors = segment_config
+            .vector_data
+            .keys()
+            .map(|name| {
+                let cfg = dense_overrides.get(name).cloned().unwrap_or_else(|| {
+                    dense_config(segment_config, name, None, HnswConfig::default(), None)
+                });
+                (name.clone(), cfg)
+            })
+            .collect();
+
+        let sparse_vectors = segment_config
+            .sparse_vector_data
+            .iter()
+            .map(|(name, sparse_data)| {
+                let cfg = SparseVectorOptimizerConfig {
+                    memory: None,
+                    on_disk: None,
+                    full_scan_threshold: sparse_data.index.full_scan_threshold,
+                    index_datatype: sparse_data.index.datatype,
+                    storage_type: sparse_data.storage_type,
+                    modifier: sparse_data.modifier,
                 };
-            }
-        }
+                (name.clone(), cfg)
+            })
+            .collect();
 
         SegmentOptimizerConfig {
             payload_storage_type: segment_config.payload_storage_type,
-            plain_dense_vector_config: base_vector_data,
-            plain_sparse_vector_config: segment_config.sparse_vector_data.clone(),
-            dense_vector,
-            sparse_vector: segment_config
-                .sparse_vector_data
-                .keys()
-                .map(|name| (name.clone(), SparseVectorOptimizerConfig { on_disk: None }))
-                .collect(),
+            dense_vectors,
+            sparse_vectors,
+            live_vector_names: None,
         }
     }
 
@@ -120,6 +131,7 @@ mod tests {
         let locked_holder = LockedSegmentHolder::new(holder);
 
         let hnsw_config = HnswConfig {
+            memory: None,
             m: 16,
             ef_construct: 100,
             full_scan_threshold: 10,
@@ -132,11 +144,13 @@ mod tests {
         let mut dense_overrides = HashMap::new();
         dense_overrides.insert(
             VectorNameBuf::from(DEFAULT_VECTOR_NAME),
-            DenseVectorOptimizerConfig {
-                on_disk: None,
+            dense_config(
+                &base_segment_config,
+                DEFAULT_VECTOR_NAME,
+                None,
                 hnsw_config,
-                quantization_config: None,
-            },
+                None,
+            ),
         );
         let optimizer_config = segment_optimizer_config(&base_segment_config, &dense_overrides);
 
@@ -179,11 +193,13 @@ mod tests {
 
         dense_overrides.insert(
             VectorNameBuf::from(DEFAULT_VECTOR_NAME),
-            DenseVectorOptimizerConfig {
-                on_disk: None,
-                hnsw_config: changed_hnsw_config,
-                quantization_config: None,
-            },
+            dense_config(
+                &base_segment_config,
+                DEFAULT_VECTOR_NAME,
+                None,
+                changed_hnsw_config,
+                None,
+            ),
         );
         let changed_optimizer_config =
             segment_optimizer_config(&base_segment_config, &dense_overrides);
@@ -266,6 +282,7 @@ mod tests {
         let locked_holder = LockedSegmentHolder::new(holder);
 
         let hnsw_config_collection = HnswConfig {
+            memory: None,
             m: 16,
             ef_construct: 100,
             full_scan_threshold: 10,
@@ -285,19 +302,23 @@ mod tests {
         let mut dense_overrides = HashMap::new();
         dense_overrides.insert(
             VectorNameBuf::from(VECTOR1_NAME),
-            DenseVectorOptimizerConfig {
-                on_disk: Some(true),
-                hnsw_config: hnsw_config_vector1,
-                quantization_config: None,
-            },
+            dense_config(
+                &base_segment_config,
+                VECTOR1_NAME,
+                Some(true),
+                hnsw_config_vector1,
+                None,
+            ),
         );
         dense_overrides.insert(
             VectorNameBuf::from(VECTOR2_NAME),
-            DenseVectorOptimizerConfig {
-                on_disk: None,
-                hnsw_config: hnsw_config_vector2,
-                quantization_config: None,
-            },
+            dense_config(
+                &base_segment_config,
+                VECTOR2_NAME,
+                None,
+                hnsw_config_vector2,
+                None,
+            ),
         );
         let optimizer_config = segment_optimizer_config(&base_segment_config, &dense_overrides);
 
@@ -339,11 +360,13 @@ mod tests {
 
         dense_overrides.insert(
             VectorNameBuf::from(VECTOR2_NAME),
-            DenseVectorOptimizerConfig {
-                on_disk: None,
-                hnsw_config: hnsw_config_vector2_changed,
-                quantization_config: None,
-            },
+            dense_config(
+                &base_segment_config,
+                VECTOR2_NAME,
+                None,
+                hnsw_config_vector2_changed,
+                None,
+            ),
         );
         let changed_optimizer_config =
             segment_optimizer_config(&base_segment_config, &dense_overrides);
@@ -415,6 +438,7 @@ mod tests {
         let quantization_config_vector1 =
             QuantizationConfig::Scalar(segment::types::ScalarQuantization {
                 scalar: ScalarQuantizationConfig {
+                    memory: None,
                     r#type: ScalarType::Int8,
                     quantile: Some(0.99),
                     always_ram: Some(true),
@@ -441,6 +465,7 @@ mod tests {
         let quantization_config_collection =
             QuantizationConfig::Scalar(segment::types::ScalarQuantization {
                 scalar: ScalarQuantizationConfig {
+                    memory: None,
                     r#type: ScalarType::Int8,
                     quantile: Some(0.91),
                     always_ram: None,
@@ -450,19 +475,23 @@ mod tests {
         let mut dense_overrides = HashMap::new();
         dense_overrides.insert(
             VectorNameBuf::from(VECTOR1_NAME),
-            DenseVectorOptimizerConfig {
-                on_disk: None,
-                hnsw_config: HnswConfig::default(),
-                quantization_config: Some(quantization_config_vector1.clone()),
-            },
+            dense_config(
+                &base_segment_config,
+                VECTOR1_NAME,
+                None,
+                HnswConfig::default(),
+                Some(quantization_config_vector1.clone()),
+            ),
         );
         dense_overrides.insert(
             VectorNameBuf::from(VECTOR2_NAME),
-            DenseVectorOptimizerConfig {
-                on_disk: None,
-                hnsw_config: HnswConfig::default(),
-                quantization_config: Some(quantization_config_collection.clone()),
-            },
+            dense_config(
+                &base_segment_config,
+                VECTOR2_NAME,
+                None,
+                HnswConfig::default(),
+                Some(quantization_config_collection.clone()),
+            ),
         );
         let optimizer_config = segment_optimizer_config(&base_segment_config, &dense_overrides);
 
@@ -501,17 +530,20 @@ mod tests {
         // Create changed quantization config for vector2, update it in the optimizer
         let quantization_config_vector2 = QuantizationConfig::Product(ProductQuantization {
             product: ProductQuantizationConfig {
+                memory: None,
                 compression: CompressionRatio::X32,
                 always_ram: Some(true),
             },
         });
         dense_overrides.insert(
             VectorNameBuf::from(VECTOR2_NAME),
-            DenseVectorOptimizerConfig {
-                on_disk: None,
-                hnsw_config: HnswConfig::default(),
-                quantization_config: Some(quantization_config_vector2.clone()),
-            },
+            dense_config(
+                &base_segment_config,
+                VECTOR2_NAME,
+                None,
+                HnswConfig::default(),
+                Some(quantization_config_vector2.clone()),
+            ),
         );
         let changed_optimizer_config =
             segment_optimizer_config(&base_segment_config, &dense_overrides);

@@ -1,5 +1,5 @@
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use fs_err as fs;
@@ -7,8 +7,8 @@ use fs_err as fs;
 use crate::ext::aligned_vec::ACow;
 use crate::generic_consts::AccessPattern;
 use crate::universal_io::{
-    OpenOptions, Result, UniversalIoError, UniversalRead, UniversalReadFileOps, UniversalReadFs,
-    UserData, local_file_ops,
+    ListedFile, OpenOptions, UioResult, UniversalIoError, UniversalRead, UniversalReadFileOps,
+    UniversalReadFs, UserData, local_file_ops,
 };
 
 mod cached_slice;
@@ -17,9 +17,16 @@ mod pipeline;
 #[cfg(test)]
 mod tests;
 
+#[cfg(any(test, feature = "testing"))]
 pub use cached_slice::CachedSlice;
-use controller::{CacheController, CacheRead};
-use pipeline::{BorrowedDiskCacheReadPipeline, OwnedDiskCacheReadPipeline};
+#[cfg(not(any(test, feature = "testing")))]
+use cached_slice::CachedSlice;
+#[cfg(any(test, feature = "testing"))]
+pub use controller::CacheController;
+#[cfg(not(any(test, feature = "testing")))]
+use controller::CacheController;
+use controller::CacheRead;
+use pipeline::DiskCacheReadPipeline;
 
 use super::UniversalKind;
 
@@ -85,20 +92,25 @@ pub struct BlockCacheFs {
 impl UniversalReadFileOps for BlockCacheFs {
     type ContextConfig = BlockCacheConfigContext;
 
-    fn from_context(ctx: BlockCacheConfigContext) -> Result<Self> {
+    fn from_context(ctx: BlockCacheConfigContext) -> UioResult<Self> {
         Ok(Self {
             controller: ctx.controller,
         })
     }
 
-    fn list_files(&self, prefix_path: &Path) -> Result<Vec<PathBuf>> {
+    fn list_files(&self, prefix_path: &Path) -> UioResult<Vec<ListedFile>> {
         local_file_ops::local_list_files(prefix_path)
     }
 
-    fn exists(&self, path: &Path) -> Result<bool> {
+    fn exists(&self, path: &Path) -> UioResult<bool> {
         fs::exists(path).map_err(UniversalIoError::from)
     }
 }
+
+// Deliberately no `UniversalWriteFileOps` impl: the block cache is strictly
+// read-only ([`CachedSlice`] neither writes nor appends, and `open` rejects
+// writeable opens). Mutations go straight to the underlying local
+// filesystem — `MmapFs`/`IoUringFs` over the very same paths.
 
 impl UniversalReadFs for BlockCacheFs {
     type File = CachedSlice;
@@ -109,7 +121,7 @@ impl UniversalReadFs for BlockCacheFs {
         path: impl AsRef<Path>,
         options: OpenOptions,
         _extra: (),
-    ) -> Result<CachedSlice> {
+    ) -> UioResult<CachedSlice> {
         let OpenOptions {
             writeable,
             need_sequential: _,
@@ -118,45 +130,51 @@ impl UniversalReadFs for BlockCacheFs {
         } = options;
         debug_assert!(!writeable);
 
-        Ok(CachedSlice::open(&self.controller, path.as_ref())?)
+        CachedSlice::open(&self.controller, path.as_ref())
+            .map_err(|err| UniversalIoError::extract_not_found(err, path.as_ref()))
     }
 }
 
 impl UniversalRead for CachedSlice {
     type Fs = BlockCacheFs;
 
-    type BorrowedReadPipeline<'a, U>
-        = BorrowedDiskCacheReadPipeline<'a, U>
+    type ReadPipeline<'a, U>
+        = DiskCacheReadPipeline<'a, U>
     where
         Self: 'a,
         U: UserData;
 
-    type OwnedReadPipeline<U>
-        = OwnedDiskCacheReadPipeline<U>
-    where
-        U: UserData;
-
-    fn reopen(&mut self) -> Result<()> {
+    fn live_reload(&mut self) -> UioResult<()> {
         // TODO: revise if this is the best way to reopen
-        *self = CachedSlice::open(&self.controller, &self.path)?;
+        *self = CachedSlice::open(&self.controller, &self.path)
+            .map_err(|err| UniversalIoError::extract_not_found(err, &self.path))?;
         Ok(())
     }
 
-    fn read_bytes<P: AccessPattern>(&self, range: Range<u64>, align: usize) -> Result<ACow<'_>> {
+    fn read_bytes<P: AccessPattern>(
+        &self,
+        range: Range<u64>,
+        _access_pattern: P,
+        align: usize,
+    ) -> UioResult<ACow<'_>> {
         let start = usize::try_from(range.start).expect("range.start is within usize");
         let end = usize::try_from(range.end).expect("range.end is within usize");
         Ok(self.get_range_bytes(start..end, align)?)
     }
 
-    fn len<T>(&self) -> Result<u64> {
+    fn len<T>(&self) -> UioResult<u64> {
         Ok(Self::len::<T>(self) as u64)
     }
 
-    fn populate(&self) -> Result<()> {
+    fn populate(&self) -> UioResult<()> {
         Ok(self.populate()?)
     }
 
-    fn clear_ram_cache(&self) -> Result<()> {
+    fn populate_auto() -> bool {
+        false
+    }
+
+    fn clear_ram_cache(&self) -> UioResult<()> {
         // TODO: issue fadvise DONTNEED on the cache file's backing mmap region.
         Ok(())
     }

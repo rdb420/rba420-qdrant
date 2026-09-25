@@ -6,6 +6,7 @@ use crate::common::flags::roaring_flags::RoaringFlags;
 
 mod lifecycle;
 mod read_ops;
+pub mod update_only;
 
 pub use self::lifecycle::MutableNullIndexBuilder;
 
@@ -76,6 +77,10 @@ mod tests {
 
         let filter_is_null = FieldCondition::new_is_null(key.clone(), true);
 
+        let filter_is_not_null = FieldCondition::new_is_null(key.clone(), false);
+
+        let filter_is_empty = FieldCondition::new_is_empty(key.clone(), true);
+
         let filter_is_not_empty = FieldCondition {
             key: key.clone(),
             r#match: None,
@@ -103,10 +108,10 @@ mod tests {
             .collect();
 
         let is_empty_values: Vec<_> = (0..n)
-            .filter(|&id| null_index.values_is_empty(id))
+            .filter(|&id| null_index.values_is_empty(id).unwrap())
             .collect();
         let not_null_values: Vec<_> = (0..n)
-            .filter(|&id| !null_index.values_is_null(id))
+            .filter(|&id| !null_index.values_is_null(id).unwrap())
             .collect();
 
         for i in 0..n {
@@ -152,9 +157,22 @@ mod tests {
             .estimate_cardinality(&filter_is_not_empty, &hw_cell)
             .unwrap()
             .unwrap();
+        let is_empty_cardinality = null_index
+            .estimate_cardinality(&filter_is_empty, &hw_cell)
+            .unwrap()
+            .unwrap();
+        let not_null_cardinality = null_index
+            .estimate_cardinality(&filter_is_not_null, &hw_cell)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(is_null_cardinality.exp, 50);
         assert_eq!(non_empty_cardinality.exp, 50);
+        // Complement estimates use total − indexed count (no arbitrary delete discount).
+        assert_eq!(is_empty_cardinality.exp, 50);
+        assert_eq!(is_empty_cardinality.max, 50);
+        assert_eq!(not_null_cardinality.exp, 50);
+        assert_eq!(not_null_cardinality.max, 50);
     }
 
     #[test]
@@ -173,8 +191,8 @@ mod tests {
         index.flusher()().unwrap();
 
         for i in 0..10 {
-            assert!(!index.values_is_empty(i as PointOffsetType));
-            assert!(!index.values_is_null(i as PointOffsetType));
+            assert!(!index.values_is_empty(i as PointOffsetType).unwrap());
+            assert!(!index.values_is_null(i as PointOffsetType).unwrap());
         }
     }
 }

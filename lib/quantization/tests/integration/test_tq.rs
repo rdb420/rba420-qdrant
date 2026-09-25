@@ -11,7 +11,7 @@ mod tests {
         score_2bit_internal_scalar, score_2bit_internal_weighted_scalar,
         score_4bit_internal_scalar, score_4bit_internal_weighted_scalar,
     };
-    use quantization::turboquant::{TQBits, TQMode};
+    use quantization::turboquant::{TQBits, TQMode, TQRotation};
     use rand::{RngExt, SeedableRng};
 
     use crate::metrics::{dot_similarity, l1_similarity, l2_similarity};
@@ -235,6 +235,8 @@ mod tests {
                         vectors_count,
                         bits,
                         mode,
+                        TQRotation::Padded,
+                        false,
                         1,
                         None,
                         &AtomicBool::new(false),
@@ -296,6 +298,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     num_threads,
                     None,
                     &AtomicBool::new(false),
@@ -350,6 +354,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -401,6 +407,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -452,6 +460,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -508,6 +518,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -559,6 +571,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -619,6 +633,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -672,6 +688,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -722,6 +740,8 @@ mod tests {
                 VECTORS_COUNT,
                 bits,
                 mode,
+                TQRotation::Padded,
+                false,
                 1,
                 None,
                 &AtomicBool::new(false),
@@ -776,6 +796,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -827,6 +849,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -878,6 +902,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -929,6 +955,8 @@ mod tests {
                     VECTORS_COUNT,
                     bits,
                     mode,
+                    TQRotation::Padded,
+                    false,
                     1,
                     None,
                     &AtomicBool::new(false),
@@ -995,6 +1023,8 @@ mod tests {
                 n,
                 bits,
                 mode,
+                TQRotation::Padded,
+                false,
                 1,
                 None,
                 &AtomicBool::new(false),
@@ -1033,5 +1063,137 @@ mod tests {
             plus >= normal - 0.02,
             "bits={bits:?}: Plus recall regressed (Normal={normal:.3}, Plus={plus:.3})"
         );
+    }
+
+    #[test]
+    fn test_tq_layout_size_is_multiple_of_alignment() {
+        const LAYOUT_DIMS: &[usize] = &[1, 7, 33, 65, 100, 756, 768];
+        let vectors_count = 8;
+
+        for &dim in LAYOUT_DIMS {
+            for &bits in BITS {
+                for &distance in &[
+                    DistanceType::Dot,
+                    DistanceType::Cosine,
+                    DistanceType::L1,
+                    DistanceType::L2,
+                ] {
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+                    let vector_data: Vec<Vec<f32>> = (0..vectors_count)
+                        .map(|_| {
+                            let vector: Vec<f32> =
+                                (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+                            match distance {
+                                DistanceType::Cosine => normalize(&vector),
+                                DistanceType::Dot | DistanceType::L1 | DistanceType::L2 => vector,
+                            }
+                        })
+                        .collect();
+                    let vector_parameters = VectorParameters {
+                        dim,
+                        deprecated_count: None,
+                        distance_type: distance,
+                        invert: false,
+                    };
+
+                    for &mode in &[TQMode::Normal, TQMode::Plus] {
+                        let quantized_vector_size = encoded_vectors_tq::get_quantized_vector_size(
+                            &vector_parameters,
+                            bits,
+                            mode,
+                        );
+                        let encoded = EncodedVectorsTQ::encode(
+                            vector_data.iter(),
+                            TestEncodedStorageBuilder::new(None, quantized_vector_size),
+                            &vector_parameters,
+                            vectors_count,
+                            bits,
+                            mode,
+                            TQRotation::Padded,
+                            false,
+                            1,
+                            None,
+                            &AtomicBool::new(false),
+                        )
+                        .unwrap();
+
+                        let layout = encoded.layout();
+                        assert_eq!(layout.size(), quantized_vector_size);
+                        assert_eq!(
+                            layout.size() % layout.align(),
+                            0,
+                            "dim={dim} bits={bits:?} distance={distance:?} mode={mode:?}: \
+                             layout size {} is not a multiple of alignment {}",
+                            layout.size(),
+                            layout.align(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The batched `score_points` (contiguous-run path) must reproduce
+    /// per-point `score_point` bit-exactly — including the hoisted score
+    /// inversion (L2) — for sequential, scattered, and descending id orders.
+    #[rstest::rstest]
+    #[case::dot(DistanceType::Dot, false)]
+    #[case::l2(DistanceType::L2, true)]
+    fn test_tq_score_points_matches_score_point(
+        #[case] distance_type: DistanceType,
+        #[case] invert: bool,
+    ) {
+        let dim = 128;
+        for &bits in BITS {
+            for &mode in &[TQMode::Normal, TQMode::Plus] {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+                let vector_data: Vec<Vec<f32>> = (0..VECTORS_COUNT)
+                    .map(|_| (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect())
+                    .collect();
+                let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+
+                let vector_parameters = VectorParameters {
+                    dim,
+                    deprecated_count: None,
+                    distance_type,
+                    invert,
+                };
+                let quantized_vector_size =
+                    encoded_vectors_tq::get_quantized_vector_size(&vector_parameters, bits, mode);
+                let encoded = EncodedVectorsTQ::encode(
+                    vector_data.iter(),
+                    TestEncodedStorageBuilder::new(None, quantized_vector_size),
+                    &vector_parameters,
+                    VECTORS_COUNT,
+                    bits,
+                    mode,
+                    TQRotation::Padded,
+                    false,
+                    1,
+                    None,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                let encoded_query = encoded.encode_query(&query);
+                let counter = HardwareCounterCell::new();
+
+                let sequential: Vec<u32> = (0..VECTORS_COUNT as u32).collect();
+                let scattered: Vec<u32> = (0..VECTORS_COUNT as u32).step_by(3).collect();
+                let descending: Vec<u32> = (0..VECTORS_COUNT as u32).rev().collect();
+
+                for ids in [&sequential, &scattered, &descending] {
+                    let expected: Vec<f32> = ids
+                        .iter()
+                        .map(|&id| encoded.score_point(&encoded_query, id, &counter))
+                        .collect();
+                    let mut batched = vec![0.0f32; ids.len()];
+                    encoded.score_points(&encoded_query, ids, &mut batched, &counter);
+                    assert_eq!(
+                        expected, batched,
+                        "score_points mismatch for bits={bits:?}, mode={mode:?}, distance={distance_type:?}",
+                    );
+                }
+            }
+        }
     }
 }

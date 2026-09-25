@@ -1,9 +1,9 @@
 use std::ops::Bound;
 
+use blobstore::Blob;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use common::universal_io::UniversalRead;
-use gridstore::Blob;
 
 use super::super::super::Encodable;
 use super::super::super::numeric_index_read::NumericIndexRead;
@@ -11,7 +11,7 @@ use super::ReadOnlyAppendableNumericIndex;
 use crate::common::operation_error::OperationResult;
 use crate::index::field_index::histogram::Histogram;
 use crate::index::field_index::numeric_point::{Numericable, Point};
-use crate::index::field_index::stored_point_to_values::StoredValue;
+use crate::index::field_index::on_disk_point_to_values::StoredValue;
 use crate::index::payload_config::StorageType;
 
 impl<T: Encodable + Numericable + Send + Sync + Default + StoredValue, S: UniversalRead>
@@ -24,8 +24,8 @@ where
         idx: PointOffsetType,
         check_fn: impl Fn(&T) -> bool,
         _hw_counter: &HardwareCounterCell,
-    ) -> bool {
-        self.in_memory_index.check_values_any(idx, check_fn)
+    ) -> OperationResult<bool> {
+        Ok(self.in_memory_index.check_values_any(idx, check_fn))
     }
 
     fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {

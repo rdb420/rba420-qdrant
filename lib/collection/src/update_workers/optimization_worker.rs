@@ -122,6 +122,14 @@ impl UpdateWorkers {
                 panic!("Failed to ensure there are appendable segments with capacity: {err}");
             }
 
+            // Backstop: reconcile the segment manifest with the live segment set. Registration
+            // normally happens at each publication site via the `NewSegmentToken`; this wake-up is
+            // the recovery path that picks up any registration that was skipped (e.g. an ignored
+            // token). No-op if already in sync.
+            if let Err(err) = segments.read().sync_segment_manifest(None) {
+                log::error!("Failed to write segment manifest: {err}");
+            }
+
             // If not forcing, wait on next signal if we have too many handles
             if !ignore_max_handles && optimization_handles.lock().await.len() >= max_handles {
                 continue;
@@ -132,6 +140,7 @@ impl UpdateWorkers {
                 wal.clone(),
                 update_operation_lock.clone(),
                 update_tracker.clone(),
+                some_optimizer.threshold_config().max_segment_size_bytes(),
             )
             .await
             .is_err()
@@ -441,37 +450,23 @@ impl UpdateWorkers {
         thresholds_config: &OptimizerThresholds,
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
     ) -> OperationResult<()> {
-        let no_segment_with_capacity = {
-            let segments_read = segments.read();
-            segments_read
-                .appendable_segments_ids()
-                .into_iter()
-                .filter_map(|segment_id| segments_read.get(segment_id))
-                .all(|segment| {
-                    let max_vector_size_bytes = segment
-                        .get()
-                        .read()
-                        .max_available_vectors_size_in_bytes()
-                        .unwrap_or_default();
-                    let max_segment_size_bytes = thresholds_config
-                        .max_segment_size_kb
-                        .saturating_mul(segment::common::BYTES_IN_KB);
-
-                    max_vector_size_bytes >= max_segment_size_bytes
-                })
-        };
+        let no_segment_with_capacity = !segments
+            .read()
+            .has_appendable_segment_with_capacity(thresholds_config.max_segment_size_bytes());
 
         if no_segment_with_capacity {
             log::debug!("Creating new appendable segment, all existing segments are over capacity");
 
             let segments_guard = segments.upgradable_read();
-            let new_segment = segments_guard.build_tmp_segment(
+            // Building the segment yields a `NewSegmentToken` obliging us to register it.
+            let (new_segment, token) = segments_guard.build_tmp_segment(
                 segments_path,
                 Some(segment_config.plain_segment_config()),
                 payload_index_schema,
                 thresholds_config.deferred_internal_id,
                 true,
             )?;
+            segments_guard.sync_segment_manifest(Some(token))?;
             let mut write_guard = parking_lot::RwLockUpgradableReadGuard::upgrade(segments_guard);
             write_guard.add_new_locked(new_segment);
         }
@@ -507,6 +502,7 @@ impl UpdateWorkers {
         wal: LockedWal,
         update_operation_lock: Arc<tokio::sync::RwLock<()>>,
         update_tracker: UpdateTracker,
+        max_segment_size_bytes: Option<std::num::NonZeroUsize>,
     ) -> CollectionResult<usize> {
         // Try to re-apply everything starting from the first failed operation
         let first_failed_operation_option = segments.read().failed_operation.iter().cloned().min();
@@ -526,6 +522,7 @@ impl UpdateWorkers {
                         operation.operation,
                         update_operation_lock.clone(),
                         update_tracker.clone(),
+                        max_segment_size_bytes,
                         &HardwareCounterCell::disposable(), // Internal operation, no measurement needed
                     )?;
                 }

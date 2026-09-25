@@ -1,5 +1,5 @@
-//! Storage-agnostic bitslice backed by any [`UniversalRead<u64>`] /
-//! [`UniversalWrite<u64>`] backend.
+//! Storage-agnostic bitslice backed by any [`UniversalRead`] /
+//! [`UniversalWrite`] backend.
 //!
 //! Provides [`BitSliceStorage`], a wrapper that interprets the underlying
 //! `u64`-element storage as a sequence of bits, supporting both read and write
@@ -15,8 +15,8 @@ use itertools::{Either, Itertools};
 use crate::bitvec::BitVec;
 use crate::generic_consts::Random;
 use crate::universal_io::{
-    Flusher, OpenOptions, ReadRange, Result, TypedStorage, UniversalIoError, UniversalRead,
-    UniversalReadFs, UniversalWrite,
+    Flusher, OpenOptions, ReadRange, TypedStorage, UioResult, UniversalIoError, UniversalRead,
+    UniversalReadFs, UniversalWrite, UniversalWriteFileOps,
 };
 
 /// `IterOnes` view over a `BitSlice<u64, Lsb0>` — type alias so `self_cell`
@@ -52,7 +52,7 @@ pub type MmapBitSlice = StoredBitSlice<crate::universal_io::MmapFile>;
 
 /// A storage-agnostic bitslice that supports both reading and writing bits.
 ///
-/// Wraps any [`UniversalRead<u64>`] / [`UniversalWrite<u64>`] backend and
+/// Wraps any [`UniversalRead`] / [`UniversalWrite`] backend and
 /// interprets the underlying `u64` elements as a sequence of bits.
 /// Bit-level operations are translated to element-level reads and writes
 /// on the backend.
@@ -65,12 +65,12 @@ pub struct StoredBitSlice<S> {
 
 impl<S: UniversalRead> StoredBitSlice<S> {
     /// Open a bitslice storage from the given path using backend `S`.
-    pub fn open(
-        fs: &S::Fs,
+    pub fn open<Fs: UniversalReadFs<File = S>>(
+        fs: &Fs,
         path: impl AsRef<Path>,
         options: OpenOptions,
-        extra: <S::Fs as UniversalReadFs>::OpenExtra,
-    ) -> Result<Self> {
+        extra: Fs::OpenExtra,
+    ) -> UioResult<Self> {
         let storage = TypedStorage::open(fs, path, options, extra)?;
         let element_len = storage.len()?;
         Ok(Self {
@@ -79,10 +79,49 @@ impl<S: UniversalRead> StoredBitSlice<S> {
         })
     }
 
-    pub fn reopen(&mut self) -> Result<()> {
-        self.storage.reopen()?;
+    pub fn live_reload(&mut self) -> UioResult<()> {
+        self.storage.live_reload()?;
         self.element_len = self.storage.len()?;
         Ok(())
+    }
+
+    /// Read the stored bits at `path` — or start from `seed` when the caller
+    /// already holds them, sound only with a single writer — apply `update`
+    /// (which may resize the bits), and replace the file whole via
+    /// [`atomic_save`]: the one mutation that works on backends without
+    /// random-offset writes. When `update` errors, nothing is written.
+    ///
+    /// [`atomic_save`]: UniversalWriteFileOps::atomic_save
+    pub fn atomic_update<Fs, R, E>(
+        fs: &Fs,
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+        extra: Fs::OpenExtra,
+        seed: Option<BitVec>,
+        update: impl FnOnce(&mut BitVec) -> Result<R, E>,
+    ) -> UioResult<Result<R, E>>
+    where
+        Fs: UniversalReadFs<File = S> + UniversalWriteFileOps,
+    {
+        let path = path.as_ref();
+
+        let mut bits = match seed {
+            Some(bits) => bits,
+            None => {
+                // Dropped before the save: Windows cannot replace a mapped file.
+                let stored = Self::open(fs, path, options, extra)?;
+                stored.read_all()?.into_owned()
+            }
+        };
+
+        let result = match update(&mut bits) {
+            Ok(result) => result,
+            Err(err) => return Ok(Err(err)),
+        };
+
+        fs.atomic_save(path, bytemuck::cast_slice(bits.as_raw_slice()))?;
+
+        Ok(Ok(result))
     }
 
     /// Total number of bits available.
@@ -121,7 +160,7 @@ impl<S: UniversalRead> StoredBitSlice<S> {
     ///
     /// Returns `Cow::Borrowed` when the backend supports zero-copy reads
     /// (e.g., mmap), otherwise returns `Cow::Owned`.
-    pub fn read_all(&self) -> Result<Cow<'_, BitSlice>> {
+    pub fn read_all(&self) -> UioResult<Cow<'_, BitSlice>> {
         let elements = self.storage.read_whole()?;
         match elements {
             Cow::Borrowed(slice) => Ok(Cow::Borrowed(BitSlice::from_slice(slice))),
@@ -134,7 +173,7 @@ impl<S: UniversalRead> StoredBitSlice<S> {
     /// The range is specified in bit indices. The underlying element reads are
     /// widened to cover full `u64` boundaries, and the returned slice is trimmed
     /// to the exact requested bit range.
-    pub fn read_bit_range(&self, range: std::ops::Range<u64>) -> Result<Cow<'_, BitSlice>> {
+    pub fn read_bit_range(&self, range: std::ops::Range<u64>) -> UioResult<Cow<'_, BitSlice>> {
         if range.is_empty() {
             return Ok(Cow::Borrowed(BitSlice::empty()));
         }
@@ -143,10 +182,10 @@ impl<S: UniversalRead> StoredBitSlice<S> {
         let elem_end = range.end.div_ceil(u64::from(BITS_PER_ELEMENT));
         let num_elements = elem_end - elem_start;
 
-        let elements = self.storage.read::<Random>(ReadRange {
-            byte_offset: elem_start * size_of::<BitStore>() as u64,
-            length: num_elements,
-        })?;
+        let elements = self.storage.read(
+            ReadRange::new(elem_start * size_of::<BitStore>() as u64, num_elements),
+            Random,
+        )?;
 
         let bit_offset = Self::bit_within_element(range.start) as usize;
         let bit_end = bit_offset + (range.end - range.start) as usize;
@@ -164,7 +203,7 @@ impl<S: UniversalRead> StoredBitSlice<S> {
     }
 
     /// Count the number of set bits in the entire storage.
-    pub fn count_ones(&self) -> Result<usize> {
+    pub fn count_ones(&self) -> UioResult<usize> {
         Ok(self.read_all()?.count_ones())
     }
 
@@ -176,7 +215,7 @@ impl<S: UniversalRead> StoredBitSlice<S> {
     /// intermediate `Vec` of set positions is allocated. Reads the whole storage
     /// including any trailing capacity, so callers that keep unused capacity
     /// cleared get back exactly their set positions.
-    pub fn iter_ones(&self) -> Result<impl Iterator<Item = u64> + '_> {
+    pub fn iter_ones(&self) -> UioResult<impl Iterator<Item = u64> + '_> {
         let cow_bitslice = self.read_all()?;
         let iter = match cow_bitslice {
             Cow::Borrowed(bitslice) => Either::Left(bitslice.iter_ones().map(|i| i as u64)),
@@ -191,7 +230,7 @@ impl<S: UniversalRead> StoredBitSlice<S> {
     /// target bit.
     ///
     /// Returns `None` if `bit_index` is out of bounds.
-    pub fn get_bit(&self, bit_index: u64) -> Result<Option<bool>> {
+    pub fn get_bit(&self, bit_index: u64) -> UioResult<Option<bool>> {
         let element_index = Self::element_idx(bit_index);
         let bit_within_element = Self::bit_within_element(bit_index);
 
@@ -199,9 +238,10 @@ impl<S: UniversalRead> StoredBitSlice<S> {
             return Ok(None);
         }
 
-        let element = self
-            .storage
-            .read::<Random>(ReadRange::one(element_index * size_of::<BitStore>() as u64))?[0];
+        let element = self.storage.read(
+            ReadRange::one(element_index * size_of::<BitStore>() as u64),
+            Random,
+        )?[0];
 
         let bitslice = BitSlice::from_element(&element);
 
@@ -212,12 +252,12 @@ impl<S: UniversalRead> StoredBitSlice<S> {
     }
 
     /// Populate the underlying storage's RAM cache.
-    pub fn populate(&self) -> Result<()> {
+    pub fn populate(&self) -> UioResult<()> {
         self.storage.populate()
     }
 
     /// Evict the underlying storage's data from RAM cache.
-    pub fn clear_ram_cache(&self) -> Result<()> {
+    pub fn clear_ram_cache(&self) -> UioResult<()> {
         self.storage.clear_ram_cache()
     }
 }
@@ -234,7 +274,7 @@ impl<S: UniversalWrite> StoredBitSlice<S> {
     pub fn set_ascending_bits_batch(
         &mut self,
         updates: impl IntoIterator<Item = (u64, bool)>,
-    ) -> Result<()> {
+    ) -> UioResult<()> {
         // Group updates into runs of consecutive elements. A new run starts
         // whenever the element index jumps by more than 1.
         let mut prev_element: Option<u64> = None;
@@ -266,10 +306,10 @@ impl<S: UniversalWrite> StoredBitSlice<S> {
 
             let mut buf = self
                 .storage
-                .read::<Random>(ReadRange {
-                    byte_offset: element_start * size_of::<BitStore>() as u64,
-                    length: num_elements,
-                })?
+                .read(
+                    ReadRange::new(element_start * size_of::<BitStore>() as u64, num_elements),
+                    Random,
+                )?
                 .into_owned();
             let bitslice = BitSlice::from_slice_mut(&mut buf);
 
@@ -292,7 +332,10 @@ impl<S: UniversalWrite> StoredBitSlice<S> {
     /// `source.len()` must not exceed the storage's bit length.
     /// If length of source is less than self's bit length,
     /// only the prefix of the storage will be modified
-    pub fn write_bitslice<T2, O2>(&mut self, source: &bitvec::slice::BitSlice<T2, O2>) -> Result<()>
+    pub fn write_bitslice<T2, O2>(
+        &mut self,
+        source: &bitvec::slice::BitSlice<T2, O2>,
+    ) -> UioResult<()>
     where
         T2: bitvec::store::BitStore,
         O2: bitvec::order::BitOrder,
@@ -314,10 +357,9 @@ impl<S: UniversalWrite> StoredBitSlice<S> {
         // Fetch existing, in case the source length is not a multiple of element size
         let element_count = bit_count.div_ceil(u64::from(BITS_PER_ELEMENT));
 
-        let existing = self.storage.read::<Random>(ReadRange {
-            byte_offset: 0,
-            length: element_count,
-        })?;
+        let existing = self
+            .storage
+            .read(ReadRange::new(0, element_count), Random)?;
 
         let mut buf = existing.into_owned();
         let buf_bits = BitSlice::from_slice_mut(&mut buf);
@@ -329,7 +371,7 @@ impl<S: UniversalWrite> StoredBitSlice<S> {
     /// Read-modify-write a single bit. Returns the previous value.
     ///
     /// Only writes to the backend if the element actually changed.
-    pub fn replace_bit(&mut self, bit_index: u64, value: bool) -> Result<bool> {
+    pub fn replace_bit(&mut self, bit_index: u64, value: bool) -> UioResult<bool> {
         let element_index = Self::element_idx(bit_index);
         let bit_within_element = Self::bit_within_element(bit_index);
 
@@ -341,9 +383,10 @@ impl<S: UniversalWrite> StoredBitSlice<S> {
             });
         }
 
-        let mut element = self
-            .storage
-            .read::<Random>(ReadRange::one(element_index * size_of::<BitStore>() as u64))?[0];
+        let mut element = self.storage.read(
+            ReadRange::one(element_index * size_of::<BitStore>() as u64),
+            Random,
+        )?[0];
 
         let element = &mut element;
 
@@ -367,6 +410,7 @@ impl<S: UniversalWrite> StoredBitSlice<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::io::Write;
 
     use tempfile::NamedTempFile;
@@ -389,6 +433,84 @@ mod tests {
         f.write_all(&buf).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    // ---- Atomic update tests ----
+
+    fn stored_ones(path: &Path) -> Vec<u64> {
+        let stored: MmapBitSlice =
+            StoredBitSlice::open(&MmapFs, path, OpenOptions::new_for_test(), ()).unwrap();
+        stored.iter_ones().unwrap().collect()
+    }
+
+    #[test]
+    fn atomic_update_reads_applies_and_replaces_the_file() {
+        // Handle closed: Windows cannot replace a file that is held open.
+        let path = create_temp_file(&[0b0000_0001]).into_temp_path();
+
+        MmapBitSlice::atomic_update(
+            &MmapFs,
+            &path,
+            OpenOptions::new_for_test(),
+            (),
+            None,
+            |bits| {
+                bits.set(3, true);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(stored_ones(&path), vec![0, 3]);
+    }
+
+    #[test]
+    fn atomic_update_starts_from_the_seed_without_reading() {
+        // Handle closed: Windows cannot replace a file that is held open.
+        let path = create_temp_file(&[0b0000_0001]).into_temp_path();
+
+        let mut seed = BitVec::new();
+        seed.resize(64, false);
+        seed.set(5, true);
+
+        MmapBitSlice::atomic_update(
+            &MmapFs,
+            &path,
+            OpenOptions::new_for_test(),
+            (),
+            Some(seed),
+            |bits| {
+                bits.set(3, true);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // The seed replaces the stored bits: bit 0 from the file is gone.
+        assert_eq!(stored_ones(&path), vec![3, 5]);
+    }
+
+    #[test]
+    fn atomic_update_saves_nothing_when_the_closure_errors() {
+        let f = create_temp_file(&[0b0000_0001]);
+
+        let result = MmapBitSlice::atomic_update(
+            &MmapFs,
+            f.path(),
+            OpenOptions::new_for_test(),
+            (),
+            None,
+            |bits| {
+                bits.set(3, true);
+                Err::<(), _>("rejected")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, Err("rejected"));
+        assert_eq!(stored_ones(f.path()), vec![0]);
     }
 
     // ---- Read tests ----
@@ -633,7 +755,7 @@ mod tests {
         let bs = storage.read_all().unwrap();
         assert_eq!(bs.len(), storage.bit_len() as usize);
         // With mmap backend, read_all returns Cow::Borrowed (zero-copy)
-        assert!(matches!(bs, Cow::Borrowed(_)));
+        assert_matches!(bs, Cow::Borrowed(_));
     }
 
     #[test]

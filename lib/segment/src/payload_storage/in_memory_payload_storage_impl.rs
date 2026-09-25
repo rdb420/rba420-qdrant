@@ -1,6 +1,9 @@
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 
+use blobstore::Blob;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::AccessPattern;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
@@ -56,6 +59,34 @@ impl PayloadStorageRead for InMemoryPayloadStorage {
         Ok(())
     }
 
+    fn read_payloads<P: AccessPattern, U: common::universal_io::UserData>(
+        &self,
+        point_offsets: impl Iterator<Item = (U, PointOffsetType)>,
+        mut callback: impl FnMut(U, Payload) -> OperationResult<()>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        for (user_data, point_offset) in point_offsets {
+            let payload = self.get(point_offset, hw_counter)?;
+            callback(user_data, payload)?;
+        }
+
+        Ok(())
+    }
+
+    fn read_payloads_raw<P: AccessPattern, U: common::universal_io::UserData>(
+        &self,
+        point_offsets: impl Iterator<Item = (U, PointOffsetType)>,
+        mut callback: impl FnMut(U, Option<&[u8]>) -> OperationResult<()>,
+        _hw_counter: &HardwareCounterCell, // No measurements for in memory storage
+    ) -> OperationResult<()> {
+        for (user_data, point_offset) in point_offsets {
+            let encoded = self.payload.get(&point_offset).map(Blob::to_bytes);
+            callback(user_data, encoded.as_deref())?;
+        }
+
+        Ok(())
+    }
+
     fn get_storage_size_bytes(&self) -> OperationResult<usize> {
         let mut estimated_size = 0;
         for (_p_id, val) in &self.payload {
@@ -91,10 +122,10 @@ impl PayloadStorage for InMemoryPayloadStorage {
         payload: &Payload,
         _hw_counter: &HardwareCounterCell, // No measurement needed for in memory payload
     ) -> OperationResult<()> {
-        match self.payload.get_mut(&point_id) {
-            Some(point_payload) => point_payload.merge(payload),
-            None => {
-                self.payload.insert(point_id, payload.to_owned());
+        match self.payload.entry(point_id) {
+            Entry::Occupied(mut e) => e.get_mut().merge(payload),
+            Entry::Vacant(e) => {
+                e.insert(payload.to_owned());
             }
         }
         Ok(())
@@ -107,12 +138,12 @@ impl PayloadStorage for InMemoryPayloadStorage {
         key: &JsonPath,
         _hw_counter: &HardwareCounterCell, // No measurements for in memory storage
     ) -> OperationResult<()> {
-        match self.payload.get_mut(&point_id) {
-            Some(point_payload) => point_payload.merge_by_key(payload, key),
-            None => {
+        match self.payload.entry(point_id) {
+            Entry::Occupied(mut e) => e.get_mut().merge_by_key(payload, key),
+            Entry::Vacant(e) => {
                 let mut dest_payload = Payload::default();
                 dest_payload.merge_by_key(payload, key);
-                self.payload.insert(point_id, dest_payload);
+                e.insert(dest_payload);
             }
         }
         Ok(())
@@ -219,6 +250,33 @@ mod tests {
             0,
             &IndexesMap::new(),
             &HardwareCounterCell::new(),
+        );
+    }
+
+    #[test]
+    fn test_read_payloads_raw_encodes_on_the_fly() {
+        let mut storage = InMemoryPayloadStorage::default();
+        let payload: Payload = serde_json::from_str(r#"{"name": "John Doe"}"#).unwrap();
+
+        let hw_counter = HardwareCounterCell::new();
+        storage.set(1, &payload, &hw_counter).unwrap();
+
+        let mut read = Vec::new();
+        storage
+            .read_payloads_raw::<common::generic_consts::Random, _>(
+                [((), 1), ((), 2)].into_iter(),
+                |(), payload| {
+                    read.push(payload.map(<[u8]>::to_vec));
+                    Ok(())
+                },
+                &hw_counter,
+            )
+            .unwrap();
+
+        assert_eq!(
+            read,
+            // Point 2 has no payload at all
+            [Some(payload.to_bytes()), None],
         );
     }
 

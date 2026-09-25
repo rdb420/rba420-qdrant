@@ -228,7 +228,9 @@ const fn default_avg_len() -> NotNan<f64> {
 pub struct TextPreprocessingConfig {
     /// Defines which language to use for text preprocessing.
     /// This parameter is used to construct default stopwords filter and stemmer.
-    /// To disable language-specific processing, set this to `"language": "none"`.
+    /// To disable language-specific processing, set `stemmer` to `{"type": "none"}`
+    /// and configure an empty stopword set. The legacy `"language": "none"` hack is
+    /// deprecated and may be rejected in a future release.
     /// If not specified, English is assumed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -293,6 +295,8 @@ pub enum DocumentOptions {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
@@ -304,7 +308,7 @@ mod tests {
         let valid_bm25_config = serde_json::to_string(&json).unwrap();
         let options: DocumentOptions = serde_json::from_str(&valid_bm25_config).unwrap();
         // Bm25 option is used only for schema, actual deserialization will happen in specialized code
-        assert!(matches!(options, DocumentOptions::Common(_)));
+        assert_matches!(options, DocumentOptions::Common(_));
     }
 }
 
@@ -933,6 +937,8 @@ pub enum Expression {
     DatetimeKey(DatetimeKeyExpression),
     Mult(MultExpression),
     Sum(SumExpression),
+    Max(MaxExpression),
+    Min(MinExpression),
     Neg(NegExpression),
     Abs(AbsExpression),
     Div(DivExpression),
@@ -941,6 +947,7 @@ pub enum Expression {
     Exp(ExpExpression),
     Log10(Log10Expression),
     Ln(LnExpression),
+    Acosh(AcoshExpression),
     LinDecay(LinDecayExpression),
     ExpDecay(ExpDecayExpression),
     GaussDecay(GaussDecayExpression),
@@ -979,6 +986,20 @@ pub struct MultExpression {
 pub struct SumExpression {
     #[validate(nested)]
     pub sum: Vec<Expression>,
+}
+
+/// Largest of the given expressions. Requires at least one operand.
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct MaxExpression {
+    #[validate(nested)]
+    pub max: Vec<Expression>,
+}
+
+/// Smallest of the given expressions. Requires at least one operand.
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct MinExpression {
+    #[validate(nested)]
+    pub min: Vec<Expression>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
@@ -1043,6 +1064,12 @@ pub struct Log10Expression {
 pub struct LnExpression {
     #[validate(nested)]
     pub ln: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct AcoshExpression {
+    #[validate(nested)]
+    pub acosh: Box<Expression>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]

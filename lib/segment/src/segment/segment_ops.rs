@@ -7,7 +7,7 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::fs::{atomic_save_json, read_json};
 use common::generic_consts::Random;
 use common::tar_unpack::tar_unpack_file;
-use common::types::PointOffsetType;
+use common::types::{DeferredBehavior, PointOffsetType};
 use fs_err as fs;
 
 use super::{
@@ -19,16 +19,28 @@ use crate::common::operation_error::{
 };
 use crate::common::{check_named_vectors, check_vector_name};
 use crate::data_types::named_vectors::NamedVectors;
+use crate::data_types::tiny_map::TinyMap;
 use crate::entry::entry_point::StorageSegmentEntry as _;
 use crate::entry::{NonAppendableSegmentEntry as _, ReadSegmentEntry};
 use crate::id_tracker::{IdTracker, IdTrackerRead};
 use crate::index::{PayloadIndex, PayloadIndexRead, VectorIndex};
 use crate::types::{
     Payload, PayloadFieldSchema, PayloadKeyType, PointIdType, SegmentState, SeqNumberType,
-    SnapshotFormat, VectorName,
+    SnapshotFormat, VectorName, VectorNameBuf,
 };
 use crate::utils;
 use crate::vector_storage::VectorStorageRead;
+
+/// Look up a named vector in the `retrieve_raw`-shaped `(name, bytes)` list.
+fn find_raw_vector<'a>(
+    vectors: &'a [(VectorNameBuf, Vec<u8>)],
+    vector_name: &VectorName,
+) -> Option<&'a [u8]> {
+    vectors
+        .iter()
+        .find(|(name, _)| name == vector_name)
+        .map(|(_, bytes)| bytes.as_slice())
+}
 
 impl Segment {
     /// Replace vectors in-place
@@ -118,23 +130,172 @@ impl Segment {
         Ok(new_index)
     }
 
-    /// Append-only update: snapshot the point at `old_id` into owned vectors
-    /// and payload, hand them to `mutate` for in-memory modification, then
-    /// write the result at a fresh internal id and repoint the id tracker.
+    /// Byte-blob analogue of [`Segment::replace_all_vectors`]: vector values
+    /// are storage-native bytes (the `retrieve_raw` form). Semantics are the
+    /// same — named vectors not present in `vectors` are deleted.
+    ///
+    /// Unlike its decoded twin, `internal_id` may also be a fresh id one past
+    /// the current end: the raw insert paths reuse this loop and the storages
+    /// grow as needed.
+    ///
+    /// # Warning
+    ///
+    /// Available for appendable segments only.
+    pub(super) fn replace_all_vectors_raw(
+        &mut self,
+        internal_id: PointOffsetType,
+        op_num: SeqNumberType,
+        vectors: &[(VectorNameBuf, Vec<u8>)],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        debug_assert!(self.is_appendable());
+        for (vector_name, vector_data) in self.vector_data.iter_mut() {
+            let bytes = find_raw_vector(vectors, vector_name);
+            let mut vector_index = vector_data.vector_index.borrow_mut();
+            vector_index.update_vector_raw(internal_id, bytes, hw_counter)?;
+            self.version_tracker.set_vector(vector_name, Some(op_num));
+        }
+        Ok(())
+    }
+
+    /// Byte-blob analogue of [`Segment::insert_new_vectors`]: vector values
+    /// are storage-native bytes (the `retrieve_raw` form).
+    ///
+    /// # Warning
+    ///
+    /// Available for appendable segments only.
+    pub(super) fn insert_new_vectors_raw(
+        &mut self,
+        point_id: PointIdType,
+        op_num: SeqNumberType,
+        vectors: &[(VectorNameBuf, Vec<u8>)],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<PointOffsetType> {
+        debug_assert!(self.is_appendable());
+        let new_index = self.id_tracker.borrow().total_point_count() as PointOffsetType;
+        self.replace_all_vectors_raw(new_index, op_num, vectors, hw_counter)?;
+        self.id_tracker.borrow_mut().set_link(point_id, new_index)?;
+        Ok(new_index)
+    }
+
+    /// Append-only counterpart of [`Segment::replace_all_vectors_raw`]: write
+    /// the raw vectors at a fresh internal id and repoint the id tracker,
+    /// tombstoning `old_id` — the raw twin of [`Segment::clone_and_mutate_point`]
+    /// specialized to full-vector replacement.
+    ///
+    /// Unlike `clone_and_mutate_point`, no vector snapshot is taken: upsert
+    /// discards every old named vector anyway, so reading them (a lossy
+    /// decode for TurboQuant storages) is unnecessary. Only the payload
+    /// survives the move; it is rewritten at the new id — always, even when
+    /// empty, for the same null-index `total_point_count` bump reason.
+    ///
+    /// Step order matches `clone_and_mutate_point`: vectors, then payload,
+    /// then `set_link` last — so a mid-way failure leaves the id tracker
+    /// still pointing at the intact `old_id`.
+    ///
+    /// # Warning
+    ///
+    /// Available for appendable segments only.
+    pub(super) fn clone_and_replace_point_raw(
+        &mut self,
+        op_num: SeqNumberType,
+        point_id: PointIdType,
+        old_id: PointOffsetType,
+        vectors: &[(VectorNameBuf, Vec<u8>)],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<PointOffsetType> {
+        debug_assert!(self.is_appendable());
+        let payload = self
+            .payload_index
+            .borrow()
+            .with_view(|view| view.get_payload(old_id, hw_counter))?;
+        let new_id = self.id_tracker.borrow().total_point_count() as PointOffsetType;
+        self.replace_all_vectors_raw(new_id, op_num, vectors, hw_counter)?;
+        self.payload_index
+            .borrow_mut()
+            .overwrite_payload(new_id, &payload, hw_counter)?;
+        // The payload content is unchanged, but writing it at `new_id` still
+        // mutates payload storage: stamp it so partial snapshots re-upload
+        // the changed files.
+        self.version_tracker.set_payload(Some(op_num));
+        self.id_tracker.borrow_mut().set_link(point_id, new_id)?;
+        Ok(new_id)
+    }
+
+    /// Write a complete point at `internal_id` in one pass: vectors from a
+    /// mix of storage-native bytes and decoded values, then the payload.
+    ///
+    /// Every configured named vector storage gets touched: a name present in
+    /// `updated_vectors` is written from its decoded value, a name present
+    /// only in `raw_vectors` is written from its bytes, and an absent name is
+    /// written as `None` (the slot is grown and marked deleted), matching
+    /// [`Segment::replace_all_vectors_raw`]'s contract. The payload is
+    /// written last — always, even when empty, for the same null-index
+    /// `total_point_count` bump reason as [`Segment::clone_and_mutate_point`].
+    ///
+    /// `internal_id` may be a fresh id one past the current end: the raw
+    /// write paths grow the storages as needed.
+    ///
+    /// # Warning
+    ///
+    /// Available for appendable segments only.
+    pub(super) fn write_point_parts(
+        &mut self,
+        internal_id: PointOffsetType,
+        op_num: SeqNumberType,
+        raw_vectors: &[(VectorNameBuf, Vec<u8>)],
+        updated_vectors: &NamedVectors,
+        payload: &Payload,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        debug_assert!(self.is_appendable());
+        for (vector_name, vector_data) in self.vector_data.iter_mut() {
+            let mut vector_index = vector_data.vector_index.borrow_mut();
+            match updated_vectors.get(vector_name) {
+                Some(vector) => {
+                    vector_index.update_vector(internal_id, Some(vector), hw_counter)?;
+                }
+                None => {
+                    let bytes = find_raw_vector(raw_vectors, vector_name);
+                    vector_index.update_vector_raw(internal_id, bytes, hw_counter)?;
+                }
+            }
+            self.version_tracker.set_vector(vector_name, Some(op_num));
+        }
+        self.payload_index
+            .borrow_mut()
+            .overwrite_payload(internal_id, payload, hw_counter)?;
+        // The overwrite mutated payload storage: stamp it so partial
+        // snapshots re-upload it (the old CoW path bumped this via
+        // `set_full_payload`).
+        self.version_tracker.set_payload(Some(op_num));
+        Ok(())
+    }
+
+    /// Append-only update: snapshot the point at `old_id` into owned raw
+    /// vectors and payload, hand them to `mutate` for in-memory modification,
+    /// then write the result at a fresh internal id and repoint the id
+    /// tracker.
     ///
     /// Step order:
     ///
-    /// 1. Read all named vectors at `old_id` into an owned `NamedVectors`,
-    ///    and the full payload at `old_id` into an owned `Payload`.
-    /// 2. Call `mutate(&mut NamedVectors, &mut Payload)` to apply the
-    ///    op-specific change in memory; its return value is propagated to
-    ///    the caller alongside the new internal id.
+    /// 1. Read all named vectors at `old_id` as storage-native bytes into an
+    ///    owned name → bytes map, and the full payload at `old_id` into an
+    ///    owned `Payload`.
+    /// 2. Call `mutate(&mut raw_vectors, &mut updated_vectors, &mut payload)`
+    ///    to apply the op-specific change in memory: drop raw entries to
+    ///    delete names, insert decoded vectors into the (initially empty)
+    ///    `updated_vectors` overlay to overwrite names. The return value is
+    ///    propagated to the caller alongside the new internal id.
     /// 3. Allocate `new_id = total_point_count()`.
-    /// 4. Write the mutated vectors at `new_id`. Every configured named
-    ///    vector storage gets touched: present entries are written, absent
-    ///    ones are inserted as `None` (so the slot is grown and marked
-    ///    deleted, matching `insert_new_vectors`'s behavior).
-    /// 5. Write the mutated payload at `new_id` (skipped if empty).
+    /// 4. Write every configured named vector at `new_id`, overlay first:
+    ///    overlaid names are written decoded, remaining raw entries are
+    ///    ingested verbatim — lossless for requantizing storages
+    ///    (TurboQuant-as-datatype) — and names in neither are inserted as
+    ///    `None` (so the slot is grown and marked deleted, matching
+    ///    `insert_new_vectors`'s behavior).
+    /// 5. Write the mutated payload at `new_id` — always, even when empty,
+    ///    so every field index covers `new_id` (see the body comment).
     /// 6. `set_link(point_id, new_id)` — auto-tombstones `old_id` in the id
     ///    tracker so it becomes invisible to queries.
     ///
@@ -153,7 +314,9 @@ impl Segment {
     ///
     /// Available for appendable segments only. Callers route into this
     /// helper from the `SegmentEntry` mutation paths when
-    /// [`Segment::is_append_only`] is true.
+    /// [`Segment::is_append_only`] is true — except for slots written by the
+    /// current operation, which are mutated in place instead (see
+    /// [`Segment::handle_point_mutate`]).
     pub(super) fn clone_and_mutate_point<F, R>(
         &mut self,
         op_num: SeqNumberType,
@@ -163,45 +326,63 @@ impl Segment {
         mutate: F,
     ) -> OperationResult<(R, PointOffsetType)>
     where
-        F: FnOnce(&mut NamedVectors<'static>, &mut Payload) -> OperationResult<R>,
+        F: FnOnce(
+            &mut TinyMap<VectorNameBuf, Vec<u8>>,
+            &mut NamedVectors<'static>,
+            &mut Payload,
+        ) -> OperationResult<R>,
     {
         debug_assert!(self.is_appendable());
 
         // 1. Snapshot vectors and payload at old_id into owned containers,
-        //    dropping all storage borrows before we start writing. Slots
-        //    that are marked deleted in the per-vector bitslice carry
-        //    leftover default-vector bytes from the original
+        //    dropping all storage borrows before we start writing. Vectors
+        //    are read as storage-native bytes: names the operation does not
+        //    overwrite travel to new_id verbatim, avoiding the lossy
+        //    dequantize→requantize round-trip of TurboQuant-as-datatype
+        //    storages. Slots that are marked deleted in the per-vector
+        //    bitslice carry leftover default-vector bytes from the original
         //    `update_vector(_, None, _)` insert — including those would
         //    promote phantom data into the fresh slot, so we skip them
-        //    and write `None` at new_id (re-tombstoning the slot).
-        let mut vectors: NamedVectors<'static> = NamedVectors::default();
+        //    and write `None` at new_id (re-tombstoning the slot). `TinyMap`
+        //    keeps the container inline (no allocation), like the decoded
+        //    `NamedVectors` snapshot this replaced.
+        let mut raw_vectors: TinyMap<VectorNameBuf, Vec<u8>> = TinyMap::new();
         for (vector_name, vector_data) in self.vector_data.iter() {
             let storage = vector_data.vector_storage.borrow();
             if storage.is_deleted_vector(old_id) {
                 continue;
             }
-            if let Some(existing) = storage.get_vector_opt::<Random>(old_id) {
-                vectors.insert(vector_name.clone(), existing.to_owned());
+            if let Some(bytes) = storage.vector_bytes_opt::<Random>(old_id)? {
+                raw_vectors.insert(vector_name.clone(), bytes);
             }
         }
+        let mut updated_vectors: NamedVectors<'static> = NamedVectors::default();
         let mut payload = self
             .payload_index
             .borrow()
             .with_view(|view| view.get_payload(old_id, hw_counter))?;
 
         // 2. Let the caller apply the op-specific change in memory.
-        let mutate_result = mutate(&mut vectors, &mut payload)?;
+        let mutate_result = mutate(&mut raw_vectors, &mut updated_vectors, &mut payload)?;
 
         // 3. Allocate the fresh internal id.
         let new_id = self.id_tracker.borrow().total_point_count() as PointOffsetType;
 
-        // 4. Write every configured named vector at new_id. Absent entries
+        // 4. Write every configured named vector at new_id, overlay first:
+        //    names the closure overwrote are written decoded, the rest are
+        //    ingested as their snapshotted bytes. Names in neither container
         //    are written as None so the storage slot grows in lockstep and
         //    is marked deleted, matching insert_new_vectors's contract.
         for (vector_name, vector_data) in self.vector_data.iter_mut() {
-            let vector_opt = vectors.get(vector_name);
             let mut vector_index = vector_data.vector_index.borrow_mut();
-            vector_index.update_vector(new_id, vector_opt, hw_counter)?;
+            match updated_vectors.get(vector_name) {
+                Some(vector) => vector_index.update_vector(new_id, Some(vector), hw_counter)?,
+                None => vector_index.update_vector_raw(
+                    new_id,
+                    raw_vectors.get(vector_name).map(Vec::as_slice),
+                    hw_counter,
+                )?,
+            }
             self.version_tracker.set_vector(vector_name, Some(op_num));
         }
 
@@ -214,6 +395,15 @@ impl Segment {
         self.payload_index
             .borrow_mut()
             .overwrite_payload(new_id, &payload, hw_counter)?;
+
+        // Writing the payload row at new_id mutated payload storage — even
+        // for a vectors-only mutation whose entry point never touches the
+        // payload version. Stamp it here so partial snapshots re-upload the
+        // changed files. The payload entry points deliberately do not bump
+        // again on this path (a same-version double bump would collapse the
+        // tracked version to `None`, degrading the stamp to the segment
+        // version): they bump inside their in-place closures instead.
+        self.version_tracker.set_payload(Some(op_num));
 
         // 6. Repoint the id tracker. `set_link` auto-tombstones old_id in
         //    the deleted bitslice when external_id was previously mapped to
@@ -230,9 +420,13 @@ impl Segment {
     ///   benefit from being moved), runs `in_place(&mut Segment, old_id)`.
     /// - On an [`Segment::is_append_only`] segment, routes through
     ///   [`Segment::clone_and_mutate_point`] with `snapshot_mutate`, which
-    ///   sees an owned snapshot of the point's vectors and payload and
-    ///   modifies it in memory; the helper writes the result at a fresh
-    ///   internal id and tombstones the old one.
+    ///   sees the point's vectors as a raw-bytes snapshot plus an empty
+    ///   decoded overlay, and the payload as an owned snapshot, and modifies
+    ///   them in memory; the helper writes the result at a fresh internal id
+    ///   and tombstones the old one. Every call clones, a slot is never
+    ///   mutated once written — whole points are written in one operation
+    ///   (see [`SegmentEntry::upsert_moved_point`]), so a multi-step write
+    ///   is a caller paying a slot per step.
     ///
     /// Both closures return the op-specific result bool (e.g. "was anything
     /// deleted"). The version-recording offset is chosen automatically:
@@ -252,7 +446,11 @@ impl Segment {
     ) -> OperationResult<bool>
     where
         InPlace: FnOnce(&mut Segment, PointOffsetType) -> OperationResult<bool>,
-        SnapshotMutate: FnOnce(&mut NamedVectors<'static>, &mut Payload) -> OperationResult<bool>,
+        SnapshotMutate: FnOnce(
+            &mut TinyMap<VectorNameBuf, Vec<u8>>,
+            &mut NamedVectors<'static>,
+            &mut Payload,
+        ) -> OperationResult<bool>,
     {
         let append_only = self.is_append_only();
         self.handle_point_version_and_failure(
@@ -283,7 +481,7 @@ impl Segment {
     /// # Arguments
     ///
     /// * `op_num` - sequential operation of the current operation
-    /// * `op` - operation to be wrapped. Should return `OperationResult` of bool (which is returned outside)
+    /// * `operation` - operation to be wrapped. Should return `OperationResult` of bool (which is returned outside)
     ///   and optionally new offset of the changed point.
     ///
     /// # Result
@@ -338,7 +536,7 @@ impl Segment {
     /// * `point_id` - external id of the point the operation targets; used for error correlation.
     /// * `op_point_offset` - If point offset is specified, handler will use point version for comparison.
     ///   Otherwise, it will be applied without version checks.
-    /// * `op` - operation to be wrapped. Should return `OperationResult` of bool (which is returned outside) and optionally new offset of the changed point.
+    /// * `operation` - operation to be wrapped. Should return `OperationResult` of bool (which is returned outside) and optionally new offset of the changed point.
     ///
     /// # Result
     ///
@@ -457,11 +655,25 @@ impl Segment {
         Ok(applied)
     }
 
+    /// `op_num` is only used to bump the payload-storage entry in
+    /// `Segment::version_tracker`, so pass `None` when there is no
+    /// associated operation (e.g. repair on load).
     pub fn delete_point_internal(
         &mut self,
         internal_id: PointOffsetType,
+        op_num: Option<SeqNumberType>,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
+        if self.is_append_only_delete() {
+            // Tombstone-only: leave the payload row and field-index postings
+            // at `internal_id` in place so the on-disk structures stay
+            // append-only. Readers filter the tombstone via the id tracker's
+            // deleted bitslice (see
+            // `PointMappingsRefEnum::filter_deferred_and_deleted`). Payload
+            // storage is untouched, so the version tracker is not bumped.
+            return self.id_tracker.borrow_mut().drop_internal(internal_id);
+        }
+
         // Mark point as deleted, drop mapping
         self.payload_index
             .borrow_mut()
@@ -473,6 +685,9 @@ impl Segment {
         // the point sits at or above the deferred threshold, with double-delete
         // protection inside `PointMappings::drop`.
         id_tracker.drop_internal(internal_id)?;
+        drop(id_tracker);
+
+        self.version_tracker.set_payload(op_num);
 
         // Before, we propagated point deletions to also delete its vectors. This turns
         // out to be problematic because this sometimes makes us lose vector data
@@ -489,24 +704,16 @@ impl Segment {
         Ok(())
     }
 
-    /// Append-only counterpart to [`Segment::delete_point_internal`]: only
-    /// touches the id tracker, leaving the payload row and field-index
-    /// postings at `internal_id` in place. Readers filter the tombstone
-    /// via the id tracker's deleted bitslice (see
-    /// `PointMappingsRefEnum::filter_deferred_and_deleted`).
-    pub fn delete_point_tombstone_only(
-        &mut self,
-        internal_id: PointOffsetType,
-    ) -> OperationResult<()> {
-        self.id_tracker.borrow_mut().drop_internal(internal_id)
-    }
-
     fn bump_segment_version(&mut self, op_num: SeqNumberType) {
         self.version.replace(max(op_num, self.version.unwrap_or(0)));
     }
 
     pub fn get_internal_id(&self, point_id: PointIdType) -> Option<PointOffsetType> {
-        self.id_tracker.borrow().internal_id(point_id)
+        // Proxy/transfer callers pair this with `point_is_deferred`; they need
+        // the latest head, so resolve with deferred preference.
+        self.id_tracker
+            .borrow()
+            .internal_id_with_behavior(point_id, DeferredBehavior::WithDeferred)
     }
 
     pub fn get_deleted_points_bitvec(&self) -> BitVec {
@@ -577,7 +784,7 @@ impl Segment {
             );
 
             for internal_id in ids_to_clean {
-                self.delete_point_internal(internal_id, &disposable_hw_counter)?;
+                self.delete_point_internal(internal_id, None, &disposable_hw_counter)?;
             }
 
             self.flush(true)?;
@@ -664,7 +871,12 @@ impl Segment {
         // dangling external ids
         let mut has_dangling_external_ids = false;
         for external_id in id_tracker.point_mappings().iter_external() {
-            if id_tracker.internal_id(external_id).is_none() {
+            // Dangling check: a point is fine as long as *some* head resolves,
+            // so prefer the deferred head and fall back to active.
+            if id_tracker
+                .internal_id_with_behavior(external_id, DeferredBehavior::WithDeferred)
+                .is_none()
+            {
                 log::error!("External id {external_id} without internal id");
                 has_dangling_external_ids = true;
             }
@@ -816,9 +1028,17 @@ fn unpack_snapshot(segment_path: &Path) -> OperationResult<()> {
         fs::remove_dir_all(&payload_index_db_backup)?;
     }
 
+    // Hoist the segment files out of the nested `files/` directory into the segment directory.
+    //
+    // Streamable snapshots historically wrap all segment files in a nested `files/` sub-directory.
+    // To allow recovering snapshots that place the files directly in the segment directory (without
+    // the `files/` wrapper), only perform the hoisting when the `files/` directory is actually
+    // present. When it is absent, the files are assumed to already be in their final location.
     let files_path = segment_path.join(SNAPSHOT_FILES_PATH);
-    utils::fs::move_all(&files_path, segment_path)?;
-    fs::remove_dir(&files_path)?;
+    if files_path.is_dir() {
+        utils::fs::move_all(&files_path, segment_path)?;
+        fs::remove_dir(&files_path)?;
+    }
 
     Ok(())
 }

@@ -44,8 +44,8 @@ def test_rejoin_cluster(tmp_path: pathlib.Path, uris_in_env):
         # fast; under CI load the consensus apply can exceed it even though the operation
         # eventually commits, so we tolerate an HTTP timeout here.
         create_collection(peer_api_uris[0], shard_number=N_SHARDS, replication_factor=N_REPLICA, timeout=3, fail_on_error=False)
-        # Collection might not be ready yet, we don't care
-        upsert_random_points(peer_api_uris[0], 100)
+        # Collection might not be ready yet, we don't care — same as the post-recovery loop.
+        upsert_random_points(peer_api_uris[0], 100, fail_on_error=False)
         print(f"before recovery end {i}")
         res = requests.get(f"{peer_api_uris[1]}/collections")
         print(res.json())
@@ -451,6 +451,11 @@ def test_replace_peer_without_shards_same_uri(tmp_path: pathlib.Path):
     # Remember the peer ID of the extra peer
     extra_peer_id = get_cluster_info(extra_peer_api_uri)['peer_id']
 
+    # Wait for the collection metadata to propagate to the extra peer before
+    # querying it. Being online and present in consensus does not guarantee the
+    # peer has already applied the collection-creation Raft entry locally.
+    wait_collection_on_all_peers("test_collection", [extra_peer_api_uri])
+
     # Verify extra peer has no shards
     collection_cluster_info = get_collection_cluster_info(extra_peer_api_uri, "test_collection")
     assert len(collection_cluster_info["local_shards"]) == 0
@@ -513,6 +518,11 @@ def test_replace_running_peer_without_shards_same_uri(tmp_path: pathlib.Path):
     # Remember the peer ID and p2p URI of the extra peer
     extra_peer_id = get_cluster_info(extra_peer_api_uri)['peer_id']
     extra_peer_p2p_uri = get_uri(extra_peer_port)
+
+    # Wait for the collection metadata to propagate to the extra peer before
+    # querying it. Being online and present in consensus does not guarantee the
+    # peer has already applied the collection-creation Raft entry locally.
+    wait_collection_on_all_peers("test_collection", [extra_peer_api_uri])
 
     # Verify extra peer has no shards
     collection_cluster_info = get_collection_cluster_info(extra_peer_api_uri, "test_collection")
