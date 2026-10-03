@@ -1,21 +1,4 @@
+# Fork: Dependabot was configured for upstream's `dev` branch (weekly schedules).
+# Disabled so this fork does not run timed dependency PRs against a missing branch.
 version: 2
-updates:
-  - package-ecosystem: cargo
-    target-branch: "dev"
-    directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
-    labels: [dependencies]
-  - package-ecosystem: "github-actions"
-    target-branch: "dev"
-    directory: "/"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
-  - package-ecosystem: docker
-    target-branch: "dev"
-    directory: "/"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
+updates: []

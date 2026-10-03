@@ -8,8 +8,9 @@ on:
         type: boolean
         default: false
         required: true
-  push:
-    branches: [ dev ]
+  # Fork: disable dev pre-release builds (no `dev` branch; upstream GCS/PyPI publishing).
+  # push:
+  #   branches: [ dev ]
 
 permissions:
   contents: read

@@ -1,10 +1,12 @@
 name: Build and deploy docker image
 
 on:
-  push:
-    # Pattern matched against refs/tags
-    tags:
-      - '*'           # Push events to every tag not containing /
+  # Fork: disable release tag docker builds (upstream GHCR/self-hosted runners).
+  # push:
+  #   # Pattern matched against refs/tags
+  #   tags:
+  #     - '*'           # Push events to every tag not containing /
+  workflow_dispatch:
 
 jobs:
 

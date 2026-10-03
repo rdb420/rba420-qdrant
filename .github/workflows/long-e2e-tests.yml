@@ -1,8 +1,9 @@
 name: Long Integration Tests
 
 on:
-  schedule:
-    - cron: '30 6 * * *'  # At 06:30
+  # Fork: disable scheduled long e2e runs (upstream targets `dev`).
+  # schedule:
+  #   - cron: '30 6 * * *'  # At 06:30
   workflow_dispatch:
 
 permissions:
