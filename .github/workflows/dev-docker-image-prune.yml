@@ -2,8 +2,9 @@ name: Delete old container images
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 * * *"  # every day at midnight
+  # Fork: disable GHCR prune schedule (targets qdrant org packages, not this fork).
+  # schedule:
+  #   - cron: "0 0 * * *"  # every day at midnight
 
 permissions:
   packages: write

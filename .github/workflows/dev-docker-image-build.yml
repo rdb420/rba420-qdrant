@@ -2,12 +2,13 @@ name: Build and push a branch image to ghcr
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - dev
-      - master
-  repository_dispatch:
-    types: [benchmark-trigger-image-build]
+  # Fork: disable automatic branch image builds (upstream GHCR/self-hosted infra).
+  # push:
+  #   branches:
+  #     - dev
+  #     - master
+  # repository_dispatch:
+  #   types: [benchmark-trigger-image-build]
 
 permissions:
   contents: read

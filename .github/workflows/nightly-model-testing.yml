@@ -1,8 +1,9 @@
 name: Nightly Model Testing
 
 on:
-  schedule:
-    - cron: '0 2 * * *'  # At 02:00
+  # Fork: disable nightly model testing schedule (opens issues on failure; needs `dev`).
+  # schedule:
+  #   - cron: '0 2 * * *'  # At 02:00
   workflow_dispatch:
     inputs:
       op_num:
@@ -138,7 +139,8 @@ jobs:
         shell: bash
       # Only alert for unattended nightly failures; dispatch/PR runs are watched live.
       - name: Open issue on failure
-        if: ${{ failure() && github.event_name == 'schedule' }}
+        # Fork: never open issues from CI (upstream nightly only; schedule disabled above).
+        if: false
         continue-on-error: true
         uses: JasonEtco/create-an-issue@1b14a70e4d8dc185e5cc76d3bec9eab20257b2c5 # v2.9.2
         env:
